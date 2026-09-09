@@ -4,6 +4,8 @@ Ideal para quem gosta de deixar o monitor rodando em um terminal ao lado do cód
 """
 import sys
 import time
+import subprocess
+import winsound
 from datetime import datetime
 
 # Garantir UTF-8 no terminal Windows
@@ -25,6 +27,39 @@ from config import get_claude_token, load_config
 from monitor_core import ClaudeMonitor, UsageData, TokenUsage
 
 console = Console(legacy_windows=False)
+
+def send_windows_toast(title: str, message: str):
+    """Envia uma notificação nativa do Windows usando PowerShell sem dependências extras."""
+    if sys.platform != "win32":
+        return
+    
+    ps_script = f'''
+    [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+    $template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+    $textNodes = $template.GetElementsByTagName("text")
+    $textNodes.Item(0).AppendChild($template.CreateTextNode("{title}")) | Out-Null
+    $textNodes.Item(1).AppendChild($template.CreateTextNode("{message}")) | Out-Null
+    $toast = [Windows.UI.Notifications.ToastNotification]::new($template)
+    [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("Claude Monitor").Show($toast)
+    '''
+    try:
+        subprocess.Popen(["powershell", "-Command", ps_script], creationflags=subprocess.CREATE_NO_WINDOW)
+    except Exception:
+        pass
+
+def play_sound(sound_type: str):
+    """Toca sons nativos do Windows de acordo com a severidade."""
+    if sys.platform != "win32":
+        return
+    try:
+        if sound_type == "success":
+            winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC)
+        elif sound_type == "warning":
+            winsound.PlaySound("SystemExclamation", winsound.SND_ALIAS | winsound.SND_ASYNC)
+        elif sound_type == "error":
+            winsound.PlaySound("SystemHand", winsound.SND_ALIAS | winsound.SND_ASYNC)
+    except Exception:
+        pass
 
 def get_color_for_pct(pct: float) -> str:
     if pct < 50:
@@ -57,7 +92,7 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
     # ── Cabeçalho ─────────────────────────────────────────────
     title_text = Text.assemble(
         (" ✦ CLAUDE USAGE MONITOR ", "bold #D97757"),
-        ("· Desktop Edition ", "bold white"),
+        ("· Terminal Edition ", "bold white"),
         (f"[{'ONLINE' if usage.ok else 'ERRO'}]", "bold green" if usage.ok else "bold red")
     )
     header_panel = Panel(
@@ -219,6 +254,11 @@ def run_cli_loop(poll_interval: int = 120, probe_models: bool = True) -> None:
     incidents = []
     last_update_str = "--:--:--"
 
+    # Estados para acionar notificações
+    state_last_h5_reset = 0
+    state_warned_80 = False
+    state_last_incidents = 0
+
     with Live(console=console, screen=True, auto_refresh=False) as live:
         try:
             while True:
@@ -232,6 +272,30 @@ def run_cli_loop(poll_interval: int = 120, probe_models: bool = True) -> None:
                             probes = monitor.probe_models(token)
                         incidents = monitor.fetch_incidents()
                         last_update_str = datetime.now().strftime("%H:%M:%S")
+                        
+                        # ── LÓGICA DE NOTIFICAÇÕES E SONS ──
+                        
+                        # 1. Reset da janela (O reset_epoch mudou para um valor maior)
+                        if state_last_h5_reset != 0 and usage.h5_reset_epoch > state_last_h5_reset:
+                            send_windows_toast("Claude Monitor", "Seu limite de 5 horas acabou de resetar! 🎉")
+                            play_sound("success")
+                            state_warned_80 = False  # Zera o aviso de 80%
+                        state_last_h5_reset = usage.h5_reset_epoch
+
+                        # 2. Aviso de 80% de limite
+                        if usage.h5_utilization >= 80.0 and not state_warned_80:
+                            send_windows_toast("Alerta de Limite", f"Você já usou {usage.h5_utilization:.0f}% da sua cota de 5 horas. Vá com calma!")
+                            play_sound("warning")
+                            state_warned_80 = True
+                        elif usage.h5_utilization < 80.0:
+                            state_warned_80 = False
+
+                        # 3. Alerta de Incidente nos Servidores
+                        if len(incidents) > state_last_incidents:
+                            send_windows_toast("Incidente Anthropic", "Problema reportado nos servidores do Claude. Pode haver lentidão.")
+                            play_sound("error")
+                        state_last_incidents = len(incidents)
+
                     last_api_time = now
 
                 next_sec = max(0, int(poll_interval - (now - last_api_time)))
