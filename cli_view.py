@@ -338,67 +338,49 @@ def run_cli_loop(poll_interval: int = 120, probe_models: bool = True) -> None:
     
     # Estados do Robozinho / Fast Polling
     last_output_tokens = 0
-    robot_state = "idle"
-    robot_state_time = 0.0
-    robot_last_diff = 0
     tick_counter = 0
     
-    # Controle de Debounce (para não apitar enquanto ele estiver digitando/pensando)
-    is_working = False
-    last_token_increase_time = 0.0
+    # Controle Exato de Status (via sessões do Claude Code)
+    last_exact_status = "offline"
 
     with Live(console=console, screen=True, auto_refresh=False) as live:
         try:
             while keep_running:
                 now = time.time()
                 
-                # --- FAST POLLING: Ler tokens locais a cada 3 segundos ---
+                # --- FAST POLLING: Lendo Status da Sessão (A cada 1 segundo) ---
+                exact_status = monitor.get_claude_sessions_status()
+                
+                if last_exact_status == "busy" and exact_status == "idle":
+                    # Acabou de terminar uma tarefa!
+                    send_windows_toast("Claude Code Concluiu!", "A tarefa no terminal foi concluída e ele está aguardando você.")
+                    play_sound("success")
+                
+                last_exact_status = exact_status
+                
+                # Polling de Tokens (A cada 3 segundos)
                 if now - last_local_time >= 3.0:
                     new_tokens = monitor.collect_local_tokens(usage.h5_reset_epoch)
-                    
-                    # Detecta se os tokens de saída aumentaram
-                    if last_output_tokens > 0 and new_tokens.output_tokens > last_output_tokens:
-                        diff = new_tokens.output_tokens - last_output_tokens
-                        robot_last_diff += diff
-                        last_token_increase_time = now
-                        
-                        if not is_working:
-                            is_working = True
-                            robot_state = "working"
-                    
-                    # Atualiza os estados de controle locais
                     last_output_tokens = new_tokens.output_tokens
                     tokens = new_tokens
                     last_local_time = now
 
-                # --- Lógica de Máquina de Estados do Robozinho ---
-                # 1. Se estava trabalhando e ficou 7 segundos sem aumentar os tokens: Terminou!
-                if is_working and (now - last_token_increase_time > 7.0):
-                    is_working = False
-                    robot_state = "finished"
-                    robot_state_time = now
-                    
-                    send_windows_toast("Claude Concluiu Tarefa!", f"A resposta terminou e gerou +{robot_last_diff} tokens.")
-                    play_sound("success")
-                
-                # 2. Se estava comemorando e já passou o tempo (15s): Volta a dormir
-                if robot_state == "finished" and (now - robot_state_time > 15.0):
-                    robot_state = "idle"
-                    robot_last_diff = 0
-                
                 # --- Frames de Animação ---
-                if robot_state == "idle":
-                    frames = ["( 🤖 ) z  ", "( 🤖 )  z ", "( 🤖 )   Z"]
+                if exact_status == "offline":
+                    frames = ["( 🤖 ) zZ ", "( 🤖 )  zZ", "( 🤖 )   z"]
                     robot_frame = frames[tick_counter % len(frames)]
-                    robot_text = "[dim]Dormindo... (Avisarei quando ele trabalhar!)[/dim]"
-                elif robot_state == "working":
+                    robot_text = "[dim]Offline (Claude Code Fechado)[/dim]"
+                elif exact_status == "busy":
                     frames = ["( 🤖 ) ✍️  ", "( 🤖 )  ✍️ ", "( 🤖 )   ✍️"]
                     robot_frame = frames[tick_counter % len(frames)]
-                    robot_text = f"[bold yellow]Trabalhando/Escrevendo... (Já usou +{robot_last_diff})[/bold yellow]"
-                else: # finished
+                    robot_text = "[bold yellow]Trabalhando/Pensando...[/bold yellow]"
+                elif exact_status == "idle":
                     frames = ["\\( 🤖 )/ ✨", " /( 🤖 )\\ 🌟"]
                     robot_frame = frames[tick_counter % len(frames)]
-                    robot_text = f"[bold green]Acabou de Responder! (+{robot_last_diff} tokens)[/bold green]"
+                    robot_text = "[bold green]Livre (Aguardando Comando)[/bold green]"
+                else:
+                    robot_frame = "( 🤖 )"
+                    robot_text = "Desconhecido"
 
 
                 # Atualização periódica da API (Pesada, usa internet)

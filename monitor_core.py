@@ -194,25 +194,57 @@ class ClaudeMonitor:
         return results
 
     def fetch_incidents(self) -> List[Incident]:
-        """
-        Consulta o status oficial da Anthropic (status.claude.com).
-        """
+        """Busca incidentes ativos na página de status da Anthropic."""
         try:
-            r = self.session.get(STATUS_ENDPOINT, timeout=6)
+            r = requests.get("https://status.anthropic.com/api/v2/incidents/unresolved.json", timeout=10)
             if r.status_code == 200:
                 data = r.json()
                 incidents = []
                 for inc in data.get("incidents", []):
                     incidents.append(Incident(
-                        name=inc.get("name", "Incidente"),
-                        status=inc.get("status", "desconhecido"),
+                        name=inc.get("name", "Incidente Desconhecido"),
+                        status=inc.get("status", "unknown"),
                         impact=inc.get("impact", "none"),
                         created_at=inc.get("created_at", "")
                     ))
                 return incidents
+            return []
+        except Exception:
+            return []
+
+    def get_claude_sessions_status(self) -> str:
+        """
+        Lê os arquivos ~/.claude/sessions/*.json para descobrir o status exato (busy/idle)
+        do Claude Code em tempo real.
+        Retorna: 'busy', 'idle' ou 'offline'.
+        """
+        claude_dir = Path.home() / ".claude" / "sessions"
+        if not claude_dir.exists():
+            return "offline"
+            
+        any_busy = False
+        any_idle = False
+        
+        try:
+            for session_file in claude_dir.glob("*.json"):
+                try:
+                    with open(session_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        st = data.get("status", "")
+                        if st == "busy":
+                            any_busy = True
+                        elif st == "idle":
+                            any_idle = True
+                except Exception:
+                    continue
         except Exception:
             pass
-        return []
+            
+        if any_busy:
+            return "busy"
+        if any_idle:
+            return "idle"
+        return "offline"
 
     def collect_local_tokens(self, h5_reset_epoch: Optional[int] = None) -> TokenUsage:
         """
