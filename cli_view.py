@@ -132,12 +132,12 @@ def make_gauge_bar(pct: float, total_bars: int = 24) -> Text:
 
 def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage,
                     probes: list, incidents: list, last_update_str: str,
-                    next_refresh_sec: int) -> Layout:
+                    next_refresh_sec: int, robot_frame: str, robot_text: str) -> Layout:
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=3),
         Layout(name="main", size=14),
-        Layout(name="details", size=7),
+        Layout(name="details", size=9),
         Layout(name="footer", size=3)
     )
 
@@ -222,7 +222,7 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
         Layout(name="status_panel", ratio=1)
     )
 
-    # Tabela de Tokens
+    # Tabela de Tokens e Mascote
     token_table = Table.grid(expand=True, padding=(0, 1))
     token_table.add_column(style="dim white", width=14)
     token_table.add_column(style="bold white")
@@ -231,9 +231,21 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
     token_table.add_row("Cache:", f"{monitor.format_tokens(tokens.cache_tokens)} tokens")
     token_table.add_row("Sessões Ativas:", f"{tokens.sessions_count} arquivos")
 
+    # Robozinho Mascote
+    mascot_text = Text()
+    mascot_text.append("\n")
+    mascot_text.append(f" {robot_frame} ", style="bold cyan")
+    mascot_text.append_text(Text.from_markup(robot_text))
+    
+    tokens_content = Layout()
+    tokens_content.split_column(
+        Layout(token_table),
+        Layout(mascot_text)
+    )
+
     tokens_panel = Panel(
-        token_table,
-        title="[bold white]Tokens na Janela (Claude Code Local)[/bold white]",
+        tokens_content,
+        title="[bold white]Tokens Locais & Rastreador[/bold white]",
         border_style="#4ADE80" if tokens.sessions_count > 0 else "dim white"
     )
     layout["tokens_panel"].update(tokens_panel)
@@ -262,6 +274,8 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
         models_table.add_row("Incidentes:", f"[bold red]{len(incidents)} ativo(s)[/]")
     else:
         models_table.add_row("Incidentes:", "[bold green]Nenhum (status.claude.com OK)[/]")
+    models_table.add_row("", "")
+    models_table.add_row("Bandeja:", "[dim]Rodando... (Duplo clique no relógio)[/dim]")
 
     status_panel = Panel(
         models_table,
@@ -310,6 +324,7 @@ def run_cli_loop(poll_interval: int = 120, probe_models: bool = True) -> None:
     monitor = ClaudeMonitor()
 
     last_api_time = 0.0
+    last_local_time = 0.0
     usage = UsageData()
     tokens = TokenUsage()
     probes = []
@@ -320,16 +335,55 @@ def run_cli_loop(poll_interval: int = 120, probe_models: bool = True) -> None:
     state_last_h5_reset = 0
     state_warned_80 = False
     state_last_incidents = 0
+    
+    # Estados do Robozinho / Fast Polling
+    last_output_tokens = 0
+    robot_state = "idle"
+    robot_state_time = 0.0
+    robot_last_diff = 0
+    tick_counter = 0
 
     with Live(console=console, screen=True, auto_refresh=False) as live:
         try:
             while keep_running:
                 now = time.time()
-                # Atualização periódica da API
+                
+                # --- FAST POLLING: Ler tokens locais a cada 3 segundos ---
+                if now - last_local_time >= 3.0:
+                    new_tokens = monitor.collect_local_tokens(usage.h5_reset_epoch)
+                    
+                    # Detecta se os tokens de saída aumentaram (Claude respondeu!)
+                    if last_output_tokens > 0 and new_tokens.output_tokens > last_output_tokens:
+                        diff = new_tokens.output_tokens - last_output_tokens
+                        send_windows_toast("Claude Concluiu Tarefa!", f"A resposta terminou e usou +{diff} tokens de saída.")
+                        play_sound("success")
+                        
+                        robot_state = "finished"
+                        robot_state_time = now
+                        robot_last_diff = diff
+                    
+                    last_output_tokens = new_tokens.output_tokens
+                    tokens = new_tokens
+                    last_local_time = now
+
+                # Lógica de animação do Robozinho
+                if robot_state == "finished" and (now - robot_state_time > 15.0):
+                    robot_state = "idle"  # Volta a dormir após 15 segundos
+                
+                if robot_state == "idle":
+                    frames = ["( 🤖 ) z  ", "( 🤖 )  z ", "( 🤖 )   Z"]
+                    robot_frame = frames[tick_counter % len(frames)]
+                    robot_text = "[dim]Dormindo... (Avisarei quando ele responder!)[/dim]"
+                else:
+                    frames = ["\\( 🤖 )/ ✨", " /( 🤖 )\\ 🌟"]
+                    robot_frame = frames[tick_counter % len(frames)]
+                    robot_text = f"[bold green]Acabou de Responder! (+{robot_last_diff} tokens)[/bold green]"
+
+
+                # Atualização periódica da API (Pesada, usa internet)
                 if now - last_api_time >= poll_interval or last_api_time == 0.0:
                     usage = monitor.fetch_usage(token)
                     if usage.ok:
-                        tokens = monitor.collect_local_tokens(usage.h5_reset_epoch)
                         if probe_models:
                             probes = monitor.probe_models(token)
                         incidents = monitor.fetch_incidents()
@@ -363,14 +417,16 @@ def run_cli_loop(poll_interval: int = 120, probe_models: bool = True) -> None:
                 next_sec = max(0, int(poll_interval - (now - last_api_time)))
                 dashboard = build_dashboard(
                     monitor, usage, tokens, probes, incidents,
-                    last_update_str, next_sec
+                    last_update_str, next_sec, robot_frame, robot_text
                 )
                 live.update(dashboard, refresh=True)
                 
-                # Loop rápido para checar `keep_running`
+                # Loop rápido de 1 segundo para atualizar animações
                 for _ in range(10):
                     if not keep_running: break
                     time.sleep(0.1)
+                tick_counter += 1
+                
         except KeyboardInterrupt:
             pass
         finally:
