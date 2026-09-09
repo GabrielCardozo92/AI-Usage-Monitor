@@ -65,6 +65,7 @@ class TokenUsage:
     output_tokens: int = 0
     cache_tokens: int = 0
     sessions_count: int = 0
+    window_start_epoch: float = 0.0
 
 @dataclass
 class ModelProbe:
