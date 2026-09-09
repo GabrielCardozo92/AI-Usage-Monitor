@@ -242,13 +242,25 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
             if len(folder_name) > 15:
                 folder_name = folder_name[:12] + "..."
                 
+            # Formatação do Contexto (Avisos de tamanho)
+            ctx_str = f"[{monitor.format_tokens(s.context_tokens)} ctx]"
+            if s.context_tokens > 100000:
+                ctx_style = "bold red"
+                ctx_str += " ⚠️"
+            elif s.context_tokens > 50000:
+                ctx_style = "bold yellow"
+            else:
+                ctx_style = "dim white"
+                
             if s.status == "busy":
                 mascot_text.append(" ✍️  ", style="bold yellow")
                 mascot_text.append(f"{folder_name} ", style="bold white")
+                mascot_text.append(f"{ctx_str} ", style=ctx_style)
                 mascot_text.append("(Trabalhando...)\n", style="bold yellow")
             else:
                 mascot_text.append(" ✨  ", style="bold green")
                 mascot_text.append(f"{folder_name} ", style="bold white")
+                mascot_text.append(f"{ctx_str} ", style=ctx_style)
                 mascot_text.append("(Livre)\n", style="bold green")
 
     tokens_content = Layout()

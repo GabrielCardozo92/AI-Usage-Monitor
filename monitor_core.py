@@ -57,6 +57,7 @@ class ClaudeSession:
     name: str
     cwd: str
     status: str
+    context_tokens: int = 0
 
 @dataclass
 class TokenUsage:
@@ -64,7 +65,6 @@ class TokenUsage:
     output_tokens: int = 0
     cache_tokens: int = 0
     sessions_count: int = 0
-    window_start_epoch: float = 0.0
 
 @dataclass
 class ModelProbe:
@@ -221,33 +221,63 @@ class ClaudeMonitor:
 
     def get_claude_sessions(self) -> dict[int, ClaudeSession]:
         """
-        Lê os arquivos ~/.claude/sessions/*.json para rastrear todas as instâncias do Claude Code ativas.
-        Retorna um dicionário mapeando PID para os dados da sessão.
+        Lê os arquivos ~/.claude/sessions/*.json para rastrear instâncias e calcula o tamanho do contexto.
         """
-        claude_dir = Path.home() / ".claude" / "sessions"
+        claude_dir = Path.home() / ".claude"
+        sessions_dir = claude_dir / "sessions"
+        projects_dir = claude_dir / "projects"
         sessions = {}
-        if not claude_dir.exists():
+        
+        if not sessions_dir.exists():
             return sessions
             
         try:
-            for session_file in claude_dir.glob("*.json"):
+            for session_file in sessions_dir.glob("*.json"):
                 try:
                     with open(session_file, "r", encoding="utf-8") as f:
                         data = json.load(f)
                         pid = data.get("pid")
                         if pid:
                             cwd = data.get("cwd", "")
-                            # Pega o nome real da pasta em vez do nome inventado pelo Claude (ex: -e4)
                             if cwd:
                                 clean_name = Path(cwd).name
                             else:
                                 clean_name = data.get("name", f"Terminal-{pid}")
                                 
+                            session_id = data.get("sessionId")
+                            context_size = 0
+                            
+                            # Buscar o arquivo .jsonl para ver o tamanho do contexto
+                            if session_id and projects_dir.exists():
+                                log_files = list(projects_dir.glob(f"*/{session_id}.jsonl"))
+                                if log_files:
+                                    try:
+                                        with open(log_files[0], "rb") as lf:
+                                            lf.seek(0, 2)
+                                            size = lf.tell()
+                                            lf.seek(max(0, size - 8192), 0)
+                                            lines = lf.read().decode("utf-8", errors="ignore").splitlines()
+                                            for line in reversed(lines):
+                                                if '"usage":' in line:
+                                                    msg = json.loads(line)
+                                                    usage = msg.get("message", {}).get("usage")
+                                                    if not usage:
+                                                        usage = msg.get("usage")
+                                                    if usage:
+                                                        inp = usage.get("input_tokens", 0)
+                                                        cc = usage.get("cache_creation_input_tokens", 0)
+                                                        cr = usage.get("cache_read_input_tokens", 0)
+                                                        context_size = inp + cc + cr
+                                                        break
+                                    except Exception:
+                                        pass
+                                
                             sessions[pid] = ClaudeSession(
                                 pid=pid,
                                 name=clean_name,
                                 cwd=cwd,
-                                status=data.get("status", "unknown")
+                                status=data.get("status", "unknown"),
+                                context_tokens=context_size
                             )
                 except Exception:
                     continue
