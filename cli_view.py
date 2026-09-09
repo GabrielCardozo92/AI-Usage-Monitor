@@ -132,7 +132,7 @@ def make_gauge_bar(pct: float, total_bars: int = 24) -> Text:
 
 def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage,
                     probes: list, incidents: list, last_update_str: str,
-                    next_refresh_sec: int, robot_frame: str, robot_text: str) -> Layout:
+                    next_refresh_sec: int, active_sessions: dict, robot_frame: str) -> Layout:
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=3),
@@ -229,23 +229,37 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
     token_table.add_row("Entrada:", f"{monitor.format_tokens(tokens.input_tokens)} tokens")
     token_table.add_row("Saída:", f"{monitor.format_tokens(tokens.output_tokens)} tokens")
     token_table.add_row("Cache:", f"{monitor.format_tokens(tokens.cache_tokens)} tokens")
-    token_table.add_row("Sessões Ativas:", f"{tokens.sessions_count} arquivos")
-
-    # Robozinho Mascote
+    
+    # Monta a lista visual das sessões
     mascot_text = Text()
     mascot_text.append("\n")
-    mascot_text.append(f" {robot_frame} ", style="bold cyan")
-    mascot_text.append_text(Text.from_markup(robot_text))
-    
+    if not active_sessions:
+        mascot_text.append(f" {robot_frame} ", style="bold cyan")
+        mascot_text.append(" [dim]Nenhum terminal rodando Claude...[/dim]")
+    else:
+        for pid, s in active_sessions.items():
+            folder_name = s.name
+            if len(folder_name) > 15:
+                folder_name = folder_name[:12] + "..."
+                
+            if s.status == "busy":
+                mascot_text.append(f" [bold yellow]✍️[/bold yellow]  ")
+                mascot_text.append(f"{folder_name} ", style="bold white")
+                mascot_text.append(f"(Trabalhando...)\n", style="bold yellow")
+            else:
+                mascot_text.append(f" [bold green]✨[/bold green]  ")
+                mascot_text.append(f"{folder_name} ", style="bold white")
+                mascot_text.append(f"(Livre)\n", style="bold green")
+
     tokens_content = Layout()
     tokens_content.split_column(
-        Layout(token_table),
+        Layout(token_table, size=3),
         Layout(mascot_text)
     )
 
     tokens_panel = Panel(
         tokens_content,
-        title="[bold white]Tokens Locais & Rastreador[/bold white]",
+        title="[bold white]Tokens Locais & Sessões[/bold white]",
         border_style="#4ADE80" if tokens.sessions_count > 0 else "dim white"
     )
     layout["tokens_panel"].update(tokens_panel)
@@ -341,22 +355,25 @@ def run_cli_loop(poll_interval: int = 120, probe_models: bool = True) -> None:
     tick_counter = 0
     
     # Controle Exato de Status (via sessões do Claude Code)
-    last_exact_status = "offline"
-
+    last_sessions = {}
+    
     with Live(console=console, screen=True, auto_refresh=False) as live:
         try:
             while keep_running:
                 now = time.time()
                 
                 # --- FAST POLLING: Lendo Status da Sessão (A cada 1 segundo) ---
-                exact_status = monitor.get_claude_sessions_status()
+                current_sessions = monitor.get_claude_sessions()
                 
-                if last_exact_status == "busy" and exact_status == "idle":
-                    # Acabou de terminar uma tarefa!
-                    send_windows_toast("Claude Code Concluiu!", "A tarefa no terminal foi concluída e ele está aguardando você.")
-                    play_sound("success")
+                for pid, sess in current_sessions.items():
+                    if pid in last_sessions:
+                        prev_sess = last_sessions[pid]
+                        if prev_sess.status == "busy" and sess.status == "idle":
+                            # Acabou de terminar uma tarefa nessa sessão!
+                            send_windows_toast(f"Tarefa Concluída: {sess.name}", "O Claude terminou o processo e aguarda comando.")
+                            play_sound("success")
                 
-                last_exact_status = exact_status
+                last_sessions = current_sessions
                 
                 # Polling de Tokens (A cada 3 segundos)
                 if now - last_local_time >= 3.0:
@@ -365,23 +382,9 @@ def run_cli_loop(poll_interval: int = 120, probe_models: bool = True) -> None:
                     tokens = new_tokens
                     last_local_time = now
 
-                # --- Frames de Animação ---
-                if exact_status == "offline":
-                    frames = ["( 🤖 ) zZ ", "( 🤖 )  zZ", "( 🤖 )   z"]
-                    robot_frame = frames[tick_counter % len(frames)]
-                    robot_text = "[dim]Offline (Claude Code Fechado)[/dim]"
-                elif exact_status == "busy":
-                    frames = ["( 🤖 ) ✍️  ", "( 🤖 )  ✍️ ", "( 🤖 )   ✍️"]
-                    robot_frame = frames[tick_counter % len(frames)]
-                    robot_text = "[bold yellow]Trabalhando/Pensando...[/bold yellow]"
-                elif exact_status == "idle":
-                    frames = ["\\( 🤖 )/ ✨", " /( 🤖 )\\ 🌟"]
-                    robot_frame = frames[tick_counter % len(frames)]
-                    robot_text = "[bold green]Livre (Aguardando Comando)[/bold green]"
-                else:
-                    robot_frame = "( 🤖 )"
-                    robot_text = "Desconhecido"
-
+                # --- Frames de Animação para o caso "Vazio/Offline" ---
+                frames = ["( 🤖 ) zZ ", "( 🤖 )  zZ", "( 🤖 )   z"]
+                robot_frame = frames[tick_counter % len(frames)]
 
                 # Atualização periódica da API (Pesada, usa internet)
                 if now - last_api_time >= poll_interval or last_api_time == 0.0:
@@ -420,7 +423,7 @@ def run_cli_loop(poll_interval: int = 120, probe_models: bool = True) -> None:
                 next_sec = max(0, int(poll_interval - (now - last_api_time)))
                 dashboard = build_dashboard(
                     monitor, usage, tokens, probes, incidents,
-                    last_update_str, next_sec, robot_frame, robot_text
+                    last_update_str, next_sec, current_sessions, robot_frame
                 )
                 live.update(dashboard, refresh=True)
                 

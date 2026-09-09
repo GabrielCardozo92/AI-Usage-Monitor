@@ -52,6 +52,13 @@ class UsageData:
     error_msg: str = ""
 
 @dataclass
+class ClaudeSession:
+    pid: int
+    name: str
+    cwd: str
+    status: str
+
+@dataclass
 class TokenUsage:
     input_tokens: int = 0
     output_tokens: int = 0
@@ -212,39 +219,35 @@ class ClaudeMonitor:
         except Exception:
             return []
 
-    def get_claude_sessions_status(self) -> str:
+    def get_claude_sessions(self) -> dict[int, ClaudeSession]:
         """
-        Lê os arquivos ~/.claude/sessions/*.json para descobrir o status exato (busy/idle)
-        do Claude Code em tempo real.
-        Retorna: 'busy', 'idle' ou 'offline'.
+        Lê os arquivos ~/.claude/sessions/*.json para rastrear todas as instâncias do Claude Code ativas.
+        Retorna um dicionário mapeando PID para os dados da sessão.
         """
         claude_dir = Path.home() / ".claude" / "sessions"
+        sessions = {}
         if not claude_dir.exists():
-            return "offline"
+            return sessions
             
-        any_busy = False
-        any_idle = False
-        
         try:
             for session_file in claude_dir.glob("*.json"):
                 try:
                     with open(session_file, "r", encoding="utf-8") as f:
                         data = json.load(f)
-                        st = data.get("status", "")
-                        if st == "busy":
-                            any_busy = True
-                        elif st == "idle":
-                            any_idle = True
+                        pid = data.get("pid")
+                        if pid:
+                            sessions[pid] = ClaudeSession(
+                                pid=pid,
+                                name=data.get("name", f"Terminal-{pid}"),
+                                cwd=data.get("cwd", ""),
+                                status=data.get("status", "unknown")
+                            )
                 except Exception:
                     continue
         except Exception:
             pass
             
-        if any_busy:
-            return "busy"
-        if any_idle:
-            return "idle"
-        return "offline"
+        return sessions
 
     def collect_local_tokens(self, h5_reset_epoch: Optional[int] = None) -> TokenUsage:
         """
