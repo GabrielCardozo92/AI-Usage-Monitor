@@ -59,6 +59,7 @@ class ClaudeSession:
     status: str
     context_tokens: int = 0
     status_updated_at: float = 0.0
+    last_stop_reason: str = ""
 
 @dataclass
 class TokenUsage:
@@ -87,6 +88,7 @@ class ClaudeMonitor:
     def __init__(self):
         self.session = requests.Session()
         self.session_context_cache = {}
+        self.session_stop_reason_cache = {}
 
     def fetch_usage(self, token: str) -> UsageData:
         """
@@ -249,9 +251,10 @@ class ClaudeMonitor:
                                 
                             session_id = data.get("sessionId")
                             context_size = self.session_context_cache.get(session_id, 0)
+                            stop_reason = self.session_stop_reason_cache.get(session_id, "")
                             status_updated_at = data.get("statusUpdatedAt", 0) / 1000.0
                             
-                            # Buscar o arquivo .jsonl para ver o tamanho do contexto
+                            # Buscar o arquivo .jsonl para ver o tamanho do contexto e o stop_reason
                             if session_id and projects_dir.exists():
                                 log_files = list(projects_dir.glob(f"*/{session_id}.jsonl"))
                                 if log_files:
@@ -265,7 +268,14 @@ class ClaudeMonitor:
                                             for line in reversed(lines):
                                                 if '"usage":' in line:
                                                     msg = json.loads(line)
-                                                    usage = msg.get("message", {}).get("usage")
+                                                    
+                                                    # Tenta extrair o stop_reason da mensagem do assistant
+                                                    msg_data = msg.get("message", {})
+                                                    if msg_data:
+                                                        stop_reason = msg_data.get("stop_reason", "")
+                                                        self.session_stop_reason_cache[session_id] = stop_reason
+                                                        
+                                                    usage = msg_data.get("usage")
                                                     if not usage:
                                                         usage = msg.get("usage")
                                                     if usage:
@@ -284,7 +294,8 @@ class ClaudeMonitor:
                                 cwd=cwd,
                                 status=data.get("status", "unknown"),
                                 context_tokens=context_size,
-                                status_updated_at=status_updated_at
+                                status_updated_at=status_updated_at,
+                                last_stop_reason=stop_reason
                             )
                 except Exception:
                     continue
