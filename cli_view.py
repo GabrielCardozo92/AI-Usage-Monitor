@@ -3,9 +3,11 @@ cli_view.py - Dashboard em modo terminal utilizando a biblioteca Rich.
 Ideal para quem gosta de deixar o monitor rodando em um terminal ao lado do código.
 """
 import sys
+import os
 import time
 import subprocess
 import winsound
+import threading
 from datetime import datetime
 
 # Garantir UTF-8 no terminal Windows
@@ -23,10 +25,60 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from config import get_claude_token, load_config
+from config import get_claude_token
 from monitor_core import ClaudeMonitor, UsageData, TokenUsage
 
 console = Console(legacy_windows=False)
+
+# ---- CONFIGURAÇÕES DA BANDEJA DO SISTEMA (SYSTEM TRAY) ----
+tray_icon = None
+is_hidden = False
+keep_running = True
+
+def setup_system_tray():
+    if sys.platform != "win32":
+        return
+        
+    try:
+        import ctypes
+        import pystray
+        from PIL import Image, ImageDraw
+
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+
+        def toggle_window(icon, item):
+            global is_hidden
+            if is_hidden:
+                ctypes.windll.user32.ShowWindow(hwnd, 5) # SW_SHOW
+                is_hidden = False
+                icon.notify("Terminal exibido novamente.")
+            else:
+                ctypes.windll.user32.ShowWindow(hwnd, 0) # SW_HIDE
+                is_hidden = True
+                icon.notify("Rodando em segundo plano...")
+
+        def quit_app(icon, item):
+            global keep_running
+            keep_running = False
+            if is_hidden:
+                ctypes.windll.user32.ShowWindow(hwnd, 5)
+            icon.stop()
+
+        # Criar ícone simples (Quadrado Laranja)
+        img = Image.new('RGB', (64, 64), color=(30, 30, 30))
+        d = ImageDraw.Draw(img)
+        d.rectangle((16, 16, 48, 48), fill=(217, 119, 87))
+
+        menu = pystray.Menu(
+            pystray.MenuItem("Ocultar / Mostrar Terminal", toggle_window, default=True),
+            pystray.MenuItem("Sair", quit_app)
+        )
+        
+        global tray_icon
+        tray_icon = pystray.Icon("Claude Monitor", img, "Claude Usage Monitor", menu)
+        tray_icon.run()
+    except Exception as e:
+        pass
 
 def send_windows_toast(title: str, message: str):
     """Envia uma notificação nativa do Windows usando PowerShell sem dependências extras."""
@@ -226,7 +278,7 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
         (f"{next_refresh_sec}s", "bold yellow"),
         (" · Pressione ", "dim white"),
         ("Ctrl+C", "bold red"),
-        (" para sair", "dim white")
+        (" para sair (Ou oculte na bandeja)", "dim white")
     )
     footer_panel = Panel(
         Align.center(footer_text),
@@ -238,6 +290,8 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
     return layout
 
 def run_cli_loop(poll_interval: int = 120, probe_models: bool = True) -> None:
+    global keep_running
+
     token, origin = get_claude_token()
     if not token:
         console.print("[bold red]Erro:[/] Nenhum token do Claude encontrado!")
@@ -245,6 +299,14 @@ def run_cli_loop(poll_interval: int = 120, probe_models: bool = True) -> None:
         sys.exit(1)
 
     console.print(f"[dim]Autenticado via: {origin}[/dim]")
+    
+    # Inicia a thread da Bandeja do Sistema (System Tray)
+    if sys.platform == "win32":
+        tray_thread = threading.Thread(target=setup_system_tray, daemon=True)
+        tray_thread.start()
+        time.sleep(0.5)
+        send_windows_toast("Claude Monitor", "Estou rodando! Clique no ícone perto do relógio para Ocultar/Mostrar a tela preta.")
+
     monitor = ClaudeMonitor()
 
     last_api_time = 0.0
@@ -261,7 +323,7 @@ def run_cli_loop(poll_interval: int = 120, probe_models: bool = True) -> None:
 
     with Live(console=console, screen=True, auto_refresh=False) as live:
         try:
-            while True:
+            while keep_running:
                 now = time.time()
                 # Atualização periódica da API
                 if now - last_api_time >= poll_interval or last_api_time == 0.0:
@@ -279,7 +341,7 @@ def run_cli_loop(poll_interval: int = 120, probe_models: bool = True) -> None:
                         if state_last_h5_reset != 0 and usage.h5_reset_epoch > state_last_h5_reset:
                             send_windows_toast("Claude Monitor", "Seu limite de 5 horas acabou de resetar! 🎉")
                             play_sound("success")
-                            state_warned_80 = False  # Zera o aviso de 80%
+                            state_warned_80 = False
                         state_last_h5_reset = usage.h5_reset_epoch
 
                         # 2. Aviso de 80% de limite
@@ -304,9 +366,16 @@ def run_cli_loop(poll_interval: int = 120, probe_models: bool = True) -> None:
                     last_update_str, next_sec
                 )
                 live.update(dashboard, refresh=True)
-                time.sleep(1.0)
+                
+                # Loop rápido para checar `keep_running`
+                for _ in range(10):
+                    if not keep_running: break
+                    time.sleep(0.1)
         except KeyboardInterrupt:
             pass
+        finally:
+            if tray_icon:
+                tray_icon.stop()
 
 if __name__ == "__main__":
     cfg = load_config()
