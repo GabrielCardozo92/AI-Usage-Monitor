@@ -85,6 +85,7 @@ class Incident:
 class ClaudeMonitor:
     def __init__(self):
         self.session = requests.Session()
+        self.session_context_cache = {}
 
     def fetch_usage(self, token: str) -> UsageData:
         """
@@ -246,7 +247,7 @@ class ClaudeMonitor:
                                 clean_name = data.get("name", f"Terminal-{pid}")
                                 
                             session_id = data.get("sessionId")
-                            context_size = 0
+                            context_size = self.session_context_cache.get(session_id, 0)
                             
                             # Buscar o arquivo .jsonl para ver o tamanho do contexto
                             if session_id and projects_dir.exists():
@@ -256,7 +257,8 @@ class ClaudeMonitor:
                                         with open(log_files[0], "rb") as lf:
                                             lf.seek(0, 2)
                                             size = lf.tell()
-                                            lf.seek(max(0, size - 8192), 0)
+                                            # Ler até 1 MB do final para garantir que pega outputs gigantes
+                                            lf.seek(max(0, size - 1024 * 1024), 0)
                                             lines = lf.read().decode("utf-8", errors="ignore").splitlines()
                                             for line in reversed(lines):
                                                 if '"usage":' in line:
@@ -269,6 +271,7 @@ class ClaudeMonitor:
                                                         cc = usage.get("cache_creation_input_tokens", 0)
                                                         cr = usage.get("cache_read_input_tokens", 0)
                                                         context_size = inp + cc + cr
+                                                        self.session_context_cache[session_id] = context_size
                                                         break
                                     except Exception:
                                         pass
