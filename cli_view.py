@@ -36,6 +36,35 @@ is_hidden = False
 is_topmost = False
 keep_running = True
 
+def get_real_hwnd():
+    import ctypes
+    hw = ctypes.windll.kernel32.GetConsoleWindow()
+    if ctypes.windll.user32.IsWindowVisible(hw):
+        return hw
+    
+    found_hwnd = 0
+    EnumWindows = ctypes.windll.user32.EnumWindows
+    EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int))
+    GetWindowText = ctypes.windll.user32.GetWindowTextW
+    GetWindowTextLength = ctypes.windll.user32.GetWindowTextLengthW
+    
+    def foreach_window(h, lParam):
+        nonlocal found_hwnd
+        length = GetWindowTextLength(h)
+        buff = ctypes.create_unicode_buffer(length + 1)
+        GetWindowText(h, buff, length + 1)
+        if "Claude Usage Monitor" in buff.value or "WindowsTerminal" in buff.value:
+            found_hwnd = h
+            return False
+        return True
+    
+    EnumWindows(EnumWindowsProc(foreach_window), 0)
+    
+    if found_hwnd:
+        return found_hwnd
+        
+    return ctypes.windll.user32.GetForegroundWindow()
+
 def setup_system_tray():
     if sys.platform != "win32":
         return
@@ -45,7 +74,7 @@ def setup_system_tray():
         import pystray
         from PIL import Image, ImageDraw
 
-        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        hwnd = get_real_hwnd()
 
         def toggle_window(icon, item):
             global is_hidden
@@ -472,7 +501,7 @@ def run_cli_loop(poll_interval: int = 120, probe_models: bool = True) -> None:
                 
                 # Loop rápido de 1 segundo para atualizar animações
                 import ctypes
-                hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+                hwnd = get_real_hwnd()
                 
                 for _ in range(10):
                     if not keep_running: break
