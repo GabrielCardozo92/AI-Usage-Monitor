@@ -60,6 +60,7 @@ class ClaudeSession:
     context_tokens: int = 0
     status_updated_at: float = 0.0
     last_stop_reason: str = ""
+    waiting_for: str = ""
 
 @dataclass
 class TokenUsage:
@@ -295,7 +296,8 @@ class ClaudeMonitor:
                                 status=data.get("status", "unknown"),
                                 context_tokens=context_size,
                                 status_updated_at=status_updated_at,
-                                last_stop_reason=stop_reason
+                                last_stop_reason=stop_reason,
+                                waiting_for=data.get("waitingFor", "")
                             )
                 except Exception:
                     continue

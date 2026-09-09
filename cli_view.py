@@ -262,17 +262,17 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
                 mascot_text.append(f"{folder_name} ", style="bold white")
                 mascot_text.append(f"{ctx_str} ", style=ctx_style)
                 mascot_text.append(f"(Trabalhando... {timer_str})\n", style="bold yellow")
+            elif s.status == "waiting" or (s.status == "idle" and s.last_stop_reason == "tool_use"):
+                reason = "Autorização" if not s.waiting_for else s.waiting_for
+                mascot_text.append(" ⏳  ", style="bold magenta")
+                mascot_text.append(f"{folder_name} ", style="bold white")
+                mascot_text.append(f"{ctx_str} ", style=ctx_style)
+                mascot_text.append(f"(Aguardando você - {reason})\n", style="bold magenta")
             else:
-                if s.last_stop_reason == "tool_use":
-                    mascot_text.append(" ⏳  ", style="bold magenta")
-                    mascot_text.append(f"{folder_name} ", style="bold white")
-                    mascot_text.append(f"{ctx_str} ", style=ctx_style)
-                    mascot_text.append("(Aguardando você - Autorização)\n", style="bold magenta")
-                else:
-                    mascot_text.append(" ✨  ", style="bold green")
-                    mascot_text.append(f"{folder_name} ", style="bold white")
-                    mascot_text.append(f"{ctx_str} ", style=ctx_style)
-                    mascot_text.append("(Livre)\n", style="bold green")
+                mascot_text.append(" ✨  ", style="bold green")
+                mascot_text.append(f"{folder_name} ", style="bold white")
+                mascot_text.append(f"{ctx_str} ", style=ctx_style)
+                mascot_text.append("(Livre)\n", style="bold green")
 
     tokens_content = Layout()
     tokens_content.split_column(
