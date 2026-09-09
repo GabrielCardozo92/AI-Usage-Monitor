@@ -253,10 +253,15 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
                 ctx_style = "dim white"
                 
             if s.status == "busy":
+                # Calcula o tempo decorrido
+                elapsed = max(0, int(time.time() - s.status_updated_at)) if s.status_updated_at > 0 else 0
+                m, sec = divmod(elapsed, 60)
+                timer_str = f"{m:02d}:{sec:02d}"
+                
                 mascot_text.append(" ✍️  ", style="bold yellow")
                 mascot_text.append(f"{folder_name} ", style="bold white")
                 mascot_text.append(f"{ctx_str} ", style=ctx_style)
-                mascot_text.append("(Trabalhando...)\n", style="bold yellow")
+                mascot_text.append(f"(Trabalhando... {timer_str})\n", style="bold yellow")
             else:
                 mascot_text.append(" ✨  ", style="bold green")
                 mascot_text.append(f"{folder_name} ", style="bold white")

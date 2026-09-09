@@ -58,6 +58,7 @@ class ClaudeSession:
     cwd: str
     status: str
     context_tokens: int = 0
+    status_updated_at: float = 0.0
 
 @dataclass
 class TokenUsage:
@@ -248,6 +249,7 @@ class ClaudeMonitor:
                                 
                             session_id = data.get("sessionId")
                             context_size = self.session_context_cache.get(session_id, 0)
+                            status_updated_at = data.get("statusUpdatedAt", 0) / 1000.0
                             
                             # Buscar o arquivo .jsonl para ver o tamanho do contexto
                             if session_id and projects_dir.exists():
@@ -281,7 +283,8 @@ class ClaudeMonitor:
                                 name=clean_name,
                                 cwd=cwd,
                                 status=data.get("status", "unknown"),
-                                context_tokens=context_size
+                                context_tokens=context_size,
+                                status_updated_at=status_updated_at
                             )
                 except Exception:
                     continue
