@@ -61,6 +61,7 @@ class ClaudeSession:
     status_updated_at: float = 0.0
     last_stop_reason: str = ""
     waiting_for: str = ""
+    model: str = ""
 
 @dataclass
 class TokenUsage:
@@ -88,8 +89,14 @@ class Incident:
 class ClaudeMonitor:
     def __init__(self):
         self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "claude-code/2.1.5",
+            "content-type": "application/json",
+            "anthropic-beta": "oauth-2025-04-20"
+        })
         self.session_context_cache = {}
         self.session_stop_reason_cache = {}
+        self.session_model_cache = {}
 
     def fetch_usage(self, token: str) -> UsageData:
         """
@@ -253,6 +260,7 @@ class ClaudeMonitor:
                             session_id = data.get("sessionId")
                             context_size = self.session_context_cache.get(session_id, 0)
                             stop_reason = self.session_stop_reason_cache.get(session_id, "")
+                            model_name = self.session_model_cache.get(session_id, "")
                             status_updated_at = data.get("statusUpdatedAt", 0) / 1000.0
                             
                             # Buscar o arquivo .jsonl para ver o tamanho do contexto e o stop_reason
@@ -270,11 +278,16 @@ class ClaudeMonitor:
                                                 if '"usage":' in line:
                                                     msg = json.loads(line)
                                                     
-                                                    # Tenta extrair o stop_reason da mensagem do assistant
+                                                    # Tenta extrair dados da mensagem do assistant
                                                     msg_data = msg.get("message", {})
                                                     if msg_data:
                                                         stop_reason = msg_data.get("stop_reason", "")
                                                         self.session_stop_reason_cache[session_id] = stop_reason
+                                                        
+                                                        m_name = msg_data.get("model", "")
+                                                        if m_name:
+                                                            model_name = m_name
+                                                            self.session_model_cache[session_id] = model_name
                                                         
                                                     usage = msg_data.get("usage")
                                                     if not usage:
@@ -297,7 +310,8 @@ class ClaudeMonitor:
                                 context_tokens=context_size,
                                 status_updated_at=status_updated_at,
                                 last_stop_reason=stop_reason,
-                                waiting_for=data.get("waitingFor", "")
+                                waiting_for=data.get("waitingFor", ""),
+                                model=model_name
                             )
                 except Exception:
                     continue
