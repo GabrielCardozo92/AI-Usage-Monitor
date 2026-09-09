@@ -342,6 +342,10 @@ def run_cli_loop(poll_interval: int = 120, probe_models: bool = True) -> None:
     robot_state_time = 0.0
     robot_last_diff = 0
     tick_counter = 0
+    
+    # Controle de Debounce (para não apitar enquanto ele estiver digitando/pensando)
+    is_working = False
+    last_token_increase_time = 0.0
 
     with Live(console=console, screen=True, auto_refresh=False) as live:
         try:
@@ -352,29 +356,46 @@ def run_cli_loop(poll_interval: int = 120, probe_models: bool = True) -> None:
                 if now - last_local_time >= 3.0:
                     new_tokens = monitor.collect_local_tokens(usage.h5_reset_epoch)
                     
-                    # Detecta se os tokens de saída aumentaram (Claude respondeu!)
+                    # Detecta se os tokens de saída aumentaram
                     if last_output_tokens > 0 and new_tokens.output_tokens > last_output_tokens:
                         diff = new_tokens.output_tokens - last_output_tokens
-                        send_windows_toast("Claude Concluiu Tarefa!", f"A resposta terminou e usou +{diff} tokens de saída.")
-                        play_sound("success")
+                        robot_last_diff += diff
+                        last_token_increase_time = now
                         
-                        robot_state = "finished"
-                        robot_state_time = now
-                        robot_last_diff = diff
+                        if not is_working:
+                            is_working = True
+                            robot_state = "working"
                     
+                    # Atualiza os estados de controle locais
                     last_output_tokens = new_tokens.output_tokens
                     tokens = new_tokens
                     last_local_time = now
 
-                # Lógica de animação do Robozinho
-                if robot_state == "finished" and (now - robot_state_time > 15.0):
-                    robot_state = "idle"  # Volta a dormir após 15 segundos
+                # --- Lógica de Máquina de Estados do Robozinho ---
+                # 1. Se estava trabalhando e ficou 7 segundos sem aumentar os tokens: Terminou!
+                if is_working and (now - last_token_increase_time > 7.0):
+                    is_working = False
+                    robot_state = "finished"
+                    robot_state_time = now
+                    
+                    send_windows_toast("Claude Concluiu Tarefa!", f"A resposta terminou e gerou +{robot_last_diff} tokens.")
+                    play_sound("success")
                 
+                # 2. Se estava comemorando e já passou o tempo (15s): Volta a dormir
+                if robot_state == "finished" and (now - robot_state_time > 15.0):
+                    robot_state = "idle"
+                    robot_last_diff = 0
+                
+                # --- Frames de Animação ---
                 if robot_state == "idle":
                     frames = ["( 🤖 ) z  ", "( 🤖 )  z ", "( 🤖 )   Z"]
                     robot_frame = frames[tick_counter % len(frames)]
-                    robot_text = "[dim]Dormindo... (Avisarei quando ele responder!)[/dim]"
-                else:
+                    robot_text = "[dim]Dormindo... (Avisarei quando ele trabalhar!)[/dim]"
+                elif robot_state == "working":
+                    frames = ["( 🤖 ) ✍️  ", "( 🤖 )  ✍️ ", "( 🤖 )   ✍️"]
+                    robot_frame = frames[tick_counter % len(frames)]
+                    robot_text = f"[bold yellow]Trabalhando/Escrevendo... (Já usou +{robot_last_diff})[/bold yellow]"
+                else: # finished
                     frames = ["\\( 🤖 )/ ✨", " /( 🤖 )\\ 🌟"]
                     robot_frame = frames[tick_counter % len(frames)]
                     robot_text = f"[bold green]Acabou de Responder! (+{robot_last_diff} tokens)[/bold green]"
@@ -389,9 +410,9 @@ def run_cli_loop(poll_interval: int = 120, probe_models: bool = True) -> None:
                         incidents = monitor.fetch_incidents()
                         last_update_str = datetime.now().strftime("%H:%M:%S")
                         
-                        # ── LÓGICA DE NOTIFICAÇÕES E SONS ──
+                        # ── LÓGICA DE NOTIFICAÇÕES E SONS DA API ──
                         
-                        # 1. Reset da janela (O reset_epoch mudou para um valor maior)
+                        # 1. Reset da janela
                         if state_last_h5_reset != 0 and usage.h5_reset_epoch > state_last_h5_reset:
                             send_windows_toast("Claude Monitor", "Seu limite de 5 horas acabou de resetar! 🎉")
                             play_sound("success")
