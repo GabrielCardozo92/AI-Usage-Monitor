@@ -244,10 +244,10 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
                 
             # Formatação do Contexto (Avisos de tamanho)
             ctx_str = f"[{monitor.format_tokens(s.context_tokens)} ctx]"
-            if s.context_tokens > 100000:
+            if s.context_tokens > 600000:
                 ctx_style = "bold red"
                 ctx_str += " ⚠️"
-            elif s.context_tokens > 50000:
+            elif s.context_tokens > 300000:
                 ctx_style = "bold yellow"
             else:
                 ctx_style = "dim white"
