@@ -243,13 +243,13 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
                 folder_name = folder_name[:12] + "..."
                 
             if s.status == "busy":
-                mascot_text.append(f" [bold yellow]✍️[/bold yellow]  ")
+                mascot_text.append(" ✍️  ", style="bold yellow")
                 mascot_text.append(f"{folder_name} ", style="bold white")
-                mascot_text.append(f"(Trabalhando...)\n", style="bold yellow")
+                mascot_text.append("(Trabalhando...)\n", style="bold yellow")
             else:
-                mascot_text.append(f" [bold green]✨[/bold green]  ")
+                mascot_text.append(" ✨  ", style="bold green")
                 mascot_text.append(f"{folder_name} ", style="bold white")
-                mascot_text.append(f"(Livre)\n", style="bold green")
+                mascot_text.append("(Livre)\n", style="bold green")
 
     tokens_content = Layout()
     tokens_content.split_column(

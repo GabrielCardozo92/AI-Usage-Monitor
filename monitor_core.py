@@ -236,10 +236,17 @@ class ClaudeMonitor:
                         data = json.load(f)
                         pid = data.get("pid")
                         if pid:
+                            cwd = data.get("cwd", "")
+                            # Pega o nome real da pasta em vez do nome inventado pelo Claude (ex: -e4)
+                            if cwd:
+                                clean_name = Path(cwd).name
+                            else:
+                                clean_name = data.get("name", f"Terminal-{pid}")
+                                
                             sessions[pid] = ClaudeSession(
                                 pid=pid,
-                                name=data.get("name", f"Terminal-{pid}"),
-                                cwd=data.get("cwd", ""),
+                                name=clean_name,
+                                cwd=cwd,
                                 status=data.get("status", "unknown")
                             )
                 except Exception:
