@@ -33,6 +33,7 @@ console = Console(legacy_windows=False)
 # ---- CONFIGURAÇÕES DA BANDEJA DO SISTEMA (SYSTEM TRAY) ----
 tray_icon = None
 is_hidden = False
+is_topmost = False
 keep_running = True
 
 def setup_system_tray():
@@ -57,6 +58,16 @@ def setup_system_tray():
                 is_hidden = True
                 icon.notify("Rodando em segundo plano...")
 
+        def toggle_topmost(icon, item):
+            global is_topmost
+            is_topmost = not is_topmost
+            if is_topmost:
+                ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0003)
+                icon.notify("Sempre no topo: ATIVADO. (Sobrevive ao Win+D)")
+            else:
+                ctypes.windll.user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0, 0x0003)
+                icon.notify("Sempre no topo: DESATIVADO.")
+
         def quit_app(icon, item):
             global keep_running
             keep_running = False
@@ -71,6 +82,7 @@ def setup_system_tray():
 
         menu = pystray.Menu(
             pystray.MenuItem("Ocultar / Mostrar Terminal", toggle_window, default=True),
+            pystray.MenuItem("Fixar no Topo (Ignorar Win+D)", toggle_topmost, checked=lambda item: is_topmost),
             pystray.MenuItem("Sair", quit_app)
         )
         
@@ -459,8 +471,18 @@ def run_cli_loop(poll_interval: int = 120, probe_models: bool = True) -> None:
                 live.update(dashboard, refresh=True)
                 
                 # Loop rápido de 1 segundo para atualizar animações
+                import ctypes
+                hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+                
                 for _ in range(10):
                     if not keep_running: break
+                    
+                    # Combater o Win+D agressivo do Windows
+                    if is_topmost:
+                        if ctypes.windll.user32.IsIconic(hwnd):
+                            ctypes.windll.user32.ShowWindow(hwnd, 9) # SW_RESTORE
+                            ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0003)
+                            
                     time.sleep(0.1)
                 tick_counter += 1
                 
