@@ -510,7 +510,11 @@ def run_cli_loop(poll_interval: int = 120, probe_models: bool = True) -> None:
                     if is_topmost:
                         if ctypes.windll.user32.IsIconic(hwnd):
                             ctypes.windll.user32.ShowWindow(hwnd, 9) # SW_RESTORE
-                            ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0003)
+                        
+                        # 0x0013 = SWP_NOMOVE (0x02) | SWP_NOSIZE (0x01) | SWP_NOACTIVATE (0x10)
+                        # Isso força a janela a ficar acima do Desktop (que o Win+D joga pra frente)
+                        # sem roubar o foco do teclado do usuário.
+                        ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0013)
                             
                     time.sleep(0.1)
                 tick_counter += 1
