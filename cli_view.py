@@ -210,17 +210,23 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
     proj_text, proj_color = monitor.get_projection_text(usage.h5_utilization, usage.h5_reset_epoch)
 
     h5_content = Text()
-    h5_content.append(f"\n   {usage.h5_utilization:.0f}%\n", style=f"bold {h5_color}")
-    h5_content.append("   ")
-    h5_content.append_text(make_gauge_bar(usage.h5_utilization, 26))
-    h5_content.append("\n\n")
-    h5_content.append("   ⏳ Reset em: ", style="dim white")
-    h5_content.append(f"{h5_countdown} ", style="bold white")
-    h5_content.append(f"(às {h5_reset_time})\n", style="dim cyan")
-    h5_content.append("   🚦 Status: ", style="dim white")
-    h5_content.append(f"{usage.h5_status.upper()}\n", style=f"bold {h5_color}")
-    h5_content.append("   🔮 Projeção: ", style="dim white")
-    h5_content.append(f"{proj_text}\n", style=f"bold {proj_color}")
+    
+    if not usage.ok:
+        h5_content.append(f"\n   [FALHA DE COMUNICAÇÃO]\n", style="bold red")
+        h5_content.append(f"   {usage.error_msg}\n\n", style="dim red")
+        h5_content.append("   O monitor tentará reconectar\n   automaticamente em 10 segundos...", style="dim white")
+    else:
+        h5_content.append(f"\n   {usage.h5_utilization:.0f}%\n", style=f"bold {h5_color}")
+        h5_content.append("   ")
+        h5_content.append_text(make_gauge_bar(usage.h5_utilization, 26))
+        h5_content.append("\n\n")
+        h5_content.append("   ⏳ Reset em: ", style="dim white")
+        h5_content.append(f"{h5_countdown} ", style="bold white")
+        h5_content.append(f"(às {h5_reset_time})\n", style="dim cyan")
+        h5_content.append("   🚦 Status: ", style="dim white")
+        h5_content.append(f"{usage.h5_status.upper()}\n", style=f"bold {h5_color}")
+        h5_content.append("   🔮 Projeção: ", style="dim white")
+        h5_content.append(f"{proj_text}\n", style=f"bold {proj_color}")
 
     h5_panel = Panel(
         h5_content,
@@ -237,18 +243,22 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
     d7_reset_time = datetime.fromtimestamp(usage.d7_reset_epoch).strftime("%d/%m %H:%M") if usage.d7_reset_epoch else "--:--"
 
     d7_content = Text()
-    d7_content.append(f"\n   {usage.d7_utilization:.0f}%\n", style=f"bold {d7_color}")
-    d7_content.append("   ")
-    d7_content.append_text(make_gauge_bar(usage.d7_utilization, 26))
-    d7_content.append("\n\n")
-    d7_content.append("   ⏳ Reset em: ", style="dim white")
-    d7_content.append(f"{d7_countdown}\n", style="bold white")
-    d7_content.append("   📅 Data do Reset: ", style="dim white")
-    d7_content.append(f"{d7_reset_time}\n", style="dim cyan")
-    d7_content.append("   🚦 Status: ", style="dim white")
-    d7_content.append(f"{usage.d7_status.upper()}\n", style=f"bold {d7_color}")
-    d7_content.append("   ⚡ Status Geral: ", style="dim white")
-    d7_content.append(f"{usage.unified_status.upper()}\n", style="bold green" if usage.unified_status == "allowed" else "bold yellow")
+    if not usage.ok:
+        d7_content.append(f"\n   [DADOS INDISPONÍVEIS]\n", style="bold red")
+        d7_content.append("   Sem conexão com Anthropic API.\n", style="dim white")
+    else:
+        d7_content.append(f"\n   {usage.d7_utilization:.0f}%\n", style=f"bold {d7_color}")
+        d7_content.append("   ")
+        d7_content.append_text(make_gauge_bar(usage.d7_utilization, 26))
+        d7_content.append("\n\n")
+        d7_content.append("   ⏳ Reset em: ", style="dim white")
+        d7_content.append(f"{d7_countdown}\n", style="bold white")
+        d7_content.append("   📅 Data do Reset: ", style="dim white")
+        d7_content.append(f"{d7_reset_time}\n", style="dim cyan")
+        d7_content.append("   🚦 Status: ", style="dim white")
+        d7_content.append(f"{usage.d7_status.upper()}\n", style=f"bold {d7_color}")
+        d7_content.append("   ⚡ Status Geral: ", style="dim white")
+        d7_content.append(f"{usage.unified_status.upper()}\n", style="bold green" if usage.unified_status == "allowed" else "bold yellow")
 
     d7_panel = Panel(
         d7_content,
@@ -489,8 +499,11 @@ def run_cli_loop(poll_interval: int = 120, probe_models: bool = True) -> None:
                             send_windows_toast("Incidente Anthropic", "Problema reportado nos servidores do Claude. Pode haver lentidão.")
                             play_sound("error")
                         state_last_incidents = len(incidents)
-
-                    last_api_time = now
+                        
+                        last_api_time = now
+                    else:
+                        # Falhou. Em vez de esperar 120s, espera só 10s pra tentar de novo.
+                        last_api_time = now - poll_interval + 10
 
                 next_sec = max(0, int(poll_interval - (now - last_api_time)))
                 dashboard = build_dashboard(
