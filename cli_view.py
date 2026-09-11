@@ -362,10 +362,19 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
         d7_content.append(f"{d7_countdown}\n", style="bold white")
         d7_content.append("   📅 Data do Reset: ", style="dim white")
         d7_content.append(f"{d7_reset_time}\n", style="dim cyan")
-        d7_content.append("   🚦 Status: ", style="dim white")
-        d7_content.append(f"{usage.d7_status.upper()}\n", style=f"bold {d7_color}")
-        d7_content.append("   ⚡ Status Geral: ", style="dim white")
-        d7_content.append(f"{usage.unified_status.upper()}\n", style="bold green" if usage.unified_status == "allowed" else "bold yellow")
+        d7_proj, d7_proj_color = monitor.get_weekly_projection_text(usage.d7_utilization, usage.d7_reset_epoch)
+        d7_content.append("   🔮 Projeção: ", style="dim white")
+        d7_content.append(f"{d7_proj}\n", style=f"bold {d7_proj_color}")
+        d7_content.append("   📊 Por dia: ", style="dim white")
+        d7_content.append(f"{monitor.get_daily_budget_text(usage.d7_utilization, usage.d7_reset_epoch)}\n", style="bold white")
+        # Os status só aparecem como alerta: "allowed" não acrescenta nada à porcentagem
+        # (e, com a status line, é deduzido dela). A API pode mandar "allowed_warning".
+        if usage.d7_status not in ("allowed", "unknown"):
+            d7_content.append("   🚦 Status: ", style="dim white")
+            d7_content.append(f"{usage.d7_status.upper()}\n", style="bold red" if usage.d7_status == "rejected" else "bold yellow")
+        if usage.unified_status not in ("allowed", "unknown"):
+            d7_content.append("   ⚡ Status Geral: ", style="dim white")
+            d7_content.append(f"{usage.unified_status.upper()}\n", style="bold red" if usage.unified_status == "rejected" else "bold yellow")
 
     d7_panel = Panel(
         d7_content,

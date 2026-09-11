@@ -14,8 +14,10 @@ Inspirado no projeto [Claude Usage Stick](https://github.com/benevid/claude-usag
   - **Projeção de ritmo**: calcula se a cota vai durar até o reset ou a que horas irá esgotar.
 
 - **Janela Semanal (7 Dias)**:
-  - Utilização acumulada da semana, prazo de reset e status geral.
-  - Identificação do fator limitante principal (`claim: five_hour` ou `seven_day`).
+  - Utilização acumulada da semana e prazo de reset, com marcadores na barra a cada 20%.
+  - **Projeção semanal**: no ritmo atual, a quanto chega no reset ou quando esgota (a partir de 12h de janela).
+  - **Por dia**: quanto dá para usar por dia, em média, sem estourar antes do reset.
+  - Status da janela e status geral aparecem só como alerta (`ALLOWED_WARNING` ou `REJECTED`).
 
 - **Tokens e Sessões do Claude Code**:
   - Lê os transcripts locais (`~/.claude/projects/**/*.jsonl`, incluindo subagentes) e mostra os tokens de entrada, saída e cache na janela de 5h.

@@ -616,20 +616,26 @@ class ClaudeMonitor:
         return str(count)
 
     @staticmethod
+    def _pace(utilization: float, reset_epoch: int, window_sec: int) -> Tuple[float, float, float]:
+        """
+        Ritmo de consumo supondo uso linear desde o início da janela.
+        Retorna (segundos decorridos, segundos até o reset, % por segundo).
+        """
+        now = time.time()
+        elapsed = now - (reset_epoch - window_sec)
+        rate = utilization / elapsed if elapsed > 0 else 0.0
+        return elapsed, reset_epoch - now, rate
+
+    @staticmethod
     def get_projection_text(h5_utilization: float, h5_reset_epoch: int) -> Tuple[str, str]:
         """
         Calcula a projeção de consumo dentro da janela de 5 horas.
         Retorna (texto, status_color).
         """
-        now = time.time()
-        window_start = h5_reset_epoch - 5 * 3600
-        elapsed = now - window_start
+        elapsed, remaining_sec, rate_per_sec = ClaudeMonitor._pace(h5_utilization, h5_reset_epoch, 5 * 3600)
 
         if elapsed <= 60 or h5_utilization <= 0:
             return "Início da janela de 5h", "#4ADE80"
-
-        rate_per_sec = h5_utilization / elapsed
-        remaining_sec = h5_reset_epoch - now
 
         if remaining_sec <= 0:
             return "Janela resetando agora", "#4ADE80"
@@ -641,9 +647,50 @@ class ClaudeMonitor:
         else:
             # Vai estourar a cota antes do reset
             sec_to_exhaust = (100 - h5_utilization) / rate_per_sec
-            exhaust_time = datetime.fromtimestamp(now + sec_to_exhaust).strftime("%H:%M")
+            exhaust_time = datetime.fromtimestamp(time.time() + sec_to_exhaust).strftime("%H:%M")
             h = int(sec_to_exhaust // 3600)
             m = int((sec_to_exhaust % 3600) // 60)
             tempo_str = f"{h}h{m:02d}m" if h > 0 else f"{m}m"
             color = "#F87171" if sec_to_exhaust < 1800 else "#FBBF24"
             return f"No ritmo atual, esgota às {exhaust_time} (em {tempo_str})", color
+
+    @staticmethod
+    def get_weekly_projection_text(d7_utilization: float, d7_reset_epoch: int) -> Tuple[str, str]:
+        """
+        Projeção de consumo da janela semanal. Retorna (texto, cor).
+        O uso semanal oscila muito (dias de trabalho, noites paradas), então a projeção
+        só começa depois de 12h de janela, para não extrapolar poucas horas para 7 dias.
+        """
+        elapsed, remaining_sec, rate = ClaudeMonitor._pace(d7_utilization, d7_reset_epoch, 7 * 86400)
+
+        if remaining_sec <= 0:
+            return "Janela resetando agora", "#4ADE80"
+        if elapsed < 12 * 3600 or d7_utilization <= 0:
+            return "Início da semana (projeção após 12h)", "#8E8E9B"
+
+        projected_total = d7_utilization + rate * remaining_sec
+        if projected_total <= 100:
+            return f"No ritmo atual, chega a ~{projected_total:.0f}% no reset", "#4ADE80"
+
+        # Vai estourar a cota semanal antes do reset
+        sec_to_exhaust = (100 - d7_utilization) / rate
+        when = datetime.fromtimestamp(time.time() + sec_to_exhaust)
+        weekday = ("seg", "ter", "qua", "qui", "sex", "sáb", "dom")[when.weekday()]
+        d, h = int(sec_to_exhaust // 86400), int((sec_to_exhaust % 86400) // 3600)
+        m = int((sec_to_exhaust % 3600) // 60)
+        tempo_str = f"{d}d {h:02d}h" if d > 0 else f"{h}h{m:02d}m" if h > 0 else f"{m}m"
+        color = "#F87171" if sec_to_exhaust < 86400 else "#FBBF24"
+        return f"No ritmo atual, esgota {weekday} às {when:%H:%M} (em {tempo_str})", color
+
+    @staticmethod
+    def get_daily_budget_text(d7_utilization: float, d7_reset_epoch: int) -> str:
+        """Quanto dá para usar por dia, em média, sem estourar a cota semanal antes do reset."""
+        remaining_pct = max(0.0, 100 - d7_utilization)
+        days_left = (d7_reset_epoch - time.time()) / 86400
+        if days_left <= 0:
+            return "--"
+        if days_left < 1:
+            left = f"{remaining_pct:.0f}%" if remaining_pct >= 1 else "menos de 1%"
+            return f"{left} restante até o reset"
+        days = f"{days_left:.1f}".replace(".", ",")
+        return f"~{remaining_pct / days_left:.0f}%/dia até o reset ({days} dias)"
