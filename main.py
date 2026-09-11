@@ -16,13 +16,15 @@ from config import get_claude_token, load_config
 from monitor_core import ClaudeMonitor
 
 def run_once():
-    token, origin = get_claude_token(load_config().get("manual_token"))
-    if not token:
-        print("[ERRO] Nenhum token do Claude encontrado!")
-        sys.exit(1)
-
     monitor = ClaudeMonitor()
-    usage = monitor.fetch_usage(token)
+    # Mesma regra do dashboard: status line do Claude Code primeiro, API como reserva
+    usage = monitor.read_statusline_usage()
+    if usage is None:
+        token, _ = get_claude_token(load_config().get("manual_token"))
+        if not token:
+            print("[ERRO] Nenhum token do Claude encontrado!")
+            sys.exit(1)
+        usage = monitor.fetch_usage(token)
     if not usage.ok:
         print(f"[ERRO] {usage.error_msg}")
         sys.exit(1)
@@ -39,7 +41,9 @@ def run_once():
     print(f"Janela 5h:   {usage.h5_utilization:.0f}% | Reset em: {monitor.format_countdown(sec_5h)} | Status: {usage.h5_status.upper()}")
     print(f"Projecao:    {proj}")
     print(f"Janela 7d:   {usage.d7_utilization:.0f}% | Reset em: {monitor.format_countdown(sec_7d)} | Status: {usage.d7_status.upper()}")
-    print(f"Limitador:   {'Janela 5h' if usage.representative_claim == 'five_hour' else 'Janela 7d'}")
+    claim = {"five_hour": "Janela 5h", "seven_day": "Janela 7d"}.get(usage.representative_claim, "--")
+    print(f"Limitador:   {claim}")
+    print(f"Fonte:       {usage.source}")
     print("-" * 55)
     print(f"Tokens na janela de 5h (Claude Code local):")
     print(f"  - Entrada:  {monitor.format_tokens(tokens.input_tokens)} tokens")

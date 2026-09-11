@@ -14,13 +14,17 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import requests
-from config import CLAUDE_DIR, PROJECTS_DIR
+from config import CLAUDE_DIR, PROJECTS_DIR, STATUSLINE_DIR
 
 MESSAGES_ENDPOINT = "https://api.anthropic.com/v1/messages"
 STATUS_ENDPOINT = "https://status.claude.com/api/v2/summary.json"
 ANTHROPIC_VERSION = "2023-06-01"
 CLAUDE_CODE_USER_AGENT = "claude-code/2.1.5"
 PROBE_MODEL = "claude-haiku-4-5-20251001"
+
+# Até quanto tempo o uso gravado pela status line é considerado atual. Passado isso
+# (nenhuma sessão local respondendo), o monitor volta a consultar a API.
+STATUSLINE_MAX_AGE_SEC = 300
 
 # Serviços do status.claude.com exibidos no painel: (nome exibido, prefixo do nome no status page)
 WATCHED_COMPONENTS = [
@@ -66,6 +70,7 @@ class UsageData:
     overage_reason: str = ""
     timestamp: float = field(default_factory=time.time)
     latency_ms: int = 0                  # Tempo de resposta da própria consulta (Haiku)
+    source: str = "API"                  # "API" ou "status line"
     ok: bool = False
     error_msg: str = ""
 
@@ -80,6 +85,7 @@ class ClaudeSession:
     last_stop_reason: str = ""
     waiting_for: str = ""
     model: str = ""
+    context_window: int = 0              # Tamanho da janela (status line); 0 = desconhecido
 
 @dataclass
 class TokenUsage:
@@ -112,6 +118,15 @@ class _TranscriptCache:
     inode: int
     offset: int = 0                      # Bytes já processados (sempre no fim de uma linha)
     records: List[UsageRecord] = field(default_factory=list)
+
+def _read_snapshot(session_id: Optional[str]) -> dict:
+    """Dados que a status line gravou para a sessão, ou {} se não houver."""
+    if not session_id:
+        return {}
+    try:
+        return json.loads((STATUSLINE_DIR / f"{session_id}.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
 
 def _parse_ts(ts: str) -> float:
     try:
@@ -291,10 +306,62 @@ class ClaudeMonitor:
                 status_updated_at=data.get("statusUpdatedAt", 0) / 1000.0,
                 last_stop_reason=self.session_stop_reason_cache.get(session_id, ""),
                 waiting_for=data.get("waitingFor", ""),
-                model=self.session_model_cache.get(session_id, "")
+                model=self.session_model_cache.get(session_id, ""),
+                context_window=_read_snapshot(session_id).get("context_window_size") or 0
             )
 
         return sessions
+
+    def read_statusline_usage(self) -> Optional[UsageData]:
+        """
+        Uso de 5h/7d gravado pela status line do Claude Code (statusline.py), vindo do
+        próprio Claude Code, sem consultar a API. Retorna None se não houver dado recente
+        e completo de nenhuma sessão.
+        """
+        now = time.time()
+        best = None
+        for f in STATUSLINE_DIR.glob("*.json"):
+            try:
+                snap = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            captured = snap.get("captured_at", 0)
+            if now - captured > 86400:
+                f.unlink(missing_ok=True)  # Sessão antiga: não serve mais para nada
+                continue
+            rate = snap.get("rate_limits") or {}
+            h5, d7 = rate.get("five_hour"), rate.get("seven_day")
+            # O Claude Code remove a janela quando ela reseta; sem as duas, cai para a API
+            if not h5 or not d7 or now - captured > STATUSLINE_MAX_AGE_SEC:
+                continue
+            if h5.get("resets_at", 0) <= now or d7.get("resets_at", 0) <= now:
+                continue
+            # Cada sessão guarda o uso da SUA última resposta, então o arquivo gravado por
+            # último pode ter dado velho. Dentro de uma janela o uso só cresce: a janela mais
+            # nova e, nela, o maior percentual são a leitura mais recente.
+            key = (h5.get("resets_at", 0), h5.get("used_percentage") or 0, d7.get("used_percentage") or 0)
+            if best is None or key > best[0]:
+                best = (key, captured, h5, d7)
+
+        if best is None:
+            return None
+        _, captured, h5, d7 = best
+        h5_pct = float(h5.get("used_percentage") or 0)
+        d7_pct = float(d7.get("used_percentage") or 0)
+        # A status line não informa o status nem o fator limitante: status derivado do uso
+        status = lambda pct: "rejected" if pct >= 100 else "allowed"
+        return UsageData(
+            h5_utilization=h5_pct,
+            h5_reset_epoch=int(h5.get("resets_at") or 0),
+            h5_status=status(h5_pct),
+            d7_utilization=d7_pct,
+            d7_reset_epoch=int(d7.get("resets_at") or 0),
+            d7_status=status(d7_pct),
+            unified_status=status(max(h5_pct, d7_pct)),
+            timestamp=captured,
+            source="status line",
+            ok=True
+        )
 
     def _refresh_session_log(self, session_id: str) -> None:
         """

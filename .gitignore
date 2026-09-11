@@ -4,6 +4,7 @@ __pycache__/
 
 # Configs and secrets
 config.json
+statusline_data/
 .env
 .credentials.json
 

@@ -22,6 +22,7 @@ from rich.text import Text
 
 from config import get_claude_token
 from monitor_core import ClaudeMonitor, ClaudeSession, ServiceStatus, UsageData, TokenUsage
+from statusline import context_thresholds, format_window
 
 console = Console(legacy_windows=False)
 
@@ -316,7 +317,7 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
         h5_content,
         title="[bold white]Janela de 5 Horas[/bold white]",
         border_style=h5_color,
-        subtitle=f"[dim]claim: {usage.representative_claim}[/dim]"
+        subtitle=f"[dim]claim: {usage.representative_claim}[/dim]" if usage.representative_claim else None
     )
     layout["h5_panel"].update(h5_panel)
 
@@ -379,12 +380,17 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
             if len(folder_name) > 15:
                 folder_name = folder_name[:12] + "..."
 
-            # Formatação do Contexto (Avisos de tamanho)
-            ctx_str = f"[{monitor.format_tokens(s.context_tokens)} ctx]"
-            if s.context_tokens > 600000:
+            # Formatação do Contexto (avisos calibrados pela janela da sessão, se conhecida)
+            ctx_used = monitor.format_tokens(s.context_tokens)
+            if s.context_window:
+                ctx_str = f"[{ctx_used}/{format_window(s.context_window)} ctx]"
+            else:
+                ctx_str = f"[{ctx_used} ctx]"
+            warn, crit = context_thresholds(s.context_window)
+            if s.context_tokens > crit:
                 ctx_style = "bold red"
                 ctx_str += " ⚠️"
-            elif s.context_tokens > 300000:
+            elif s.context_tokens > warn:
                 ctx_style = "bold yellow"
             else:
                 ctx_style = "dim white"
@@ -424,10 +430,13 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
     health_table.add_column(style="dim white", width=12)
     health_table.add_column(style="bold white")
 
-    if usage.ok:
-        health_table.add_row("Latência:", f"[bold white]{usage.latency_ms}ms[/] [dim](Haiku)[/dim]")
+    if not usage.ok:
+        health_table.add_row("Fonte:", "[dim]--[/dim]")
+    elif usage.source == "status line":
+        age = max(0, int(time.time() - usage.timestamp))
+        health_table.add_row("Fonte:", f"[bold white]Status line[/] [dim](há {age}s, sem consulta à API)[/dim]")
     else:
-        health_table.add_row("Latência:", "[dim]--[/dim]")
+        health_table.add_row("Fonte:", f"[bold white]API[/] [dim]({usage.latency_ms}ms, Haiku)[/dim]")
 
     if service.ok:
         for name, status in service.components:
@@ -474,13 +483,17 @@ def fetch_api_data(monitor: ClaudeMonitor, manual_token: str):
     Retorna (usage, service).
     """
     try:
-        # Relê o token a cada consulta: o Claude Code renova o access token
-        # periodicamente e o antigo passa a devolver 401.
-        token, _ = get_claude_token(manual_token)
-        if token:
-            usage = monitor.fetch_usage(token)
-        else:
-            usage = UsageData(ok=False, error_msg="Nenhum token do Claude encontrado")
+        # Fonte oficial primeiro: o uso que o próprio Claude Code passa para a status line.
+        # A API só é consultada quando nenhuma sessão local tem dado recente.
+        usage = monitor.read_statusline_usage()
+        if usage is None:
+            # Relê o token a cada consulta: o Claude Code renova o access token
+            # periodicamente e o antigo passa a devolver 401.
+            token, _ = get_claude_token(manual_token)
+            if token:
+                usage = monitor.fetch_usage(token)
+            else:
+                usage = UsageData(ok=False, error_msg="Nenhum token do Claude encontrado")
     except Exception as e:
         usage = UsageData(ok=False, error_msg=f"Erro inesperado: {e}")
     # O status page é consultado mesmo se a API falhar: é justamente quando ele explica o porquê
@@ -489,6 +502,31 @@ def fetch_api_data(monitor: ClaudeMonitor, manual_token: str):
     except Exception:
         service = ServiceStatus()
     return usage, service
+
+class UsageAlerts:
+    """Notificações ligadas ao uso de 5h: reset da janela e aviso de 80%."""
+
+    def __init__(self):
+        self.last_h5_reset = 0
+        self.warned_80 = False
+
+    def check(self, usage: UsageData) -> None:
+        if not usage.ok or not usage.h5_reset_epoch:
+            return
+        # Uma janela nova termina horas depois da anterior; a margem evita alarme falso
+        # quando API e status line informam o mesmo reset com segundos de diferença.
+        if self.last_h5_reset and usage.h5_reset_epoch > self.last_h5_reset + 3600:
+            send_windows_toast("Claude Monitor", "Seu limite de 5 horas acabou de resetar! 🎉")
+            play_sound("success")
+            self.warned_80 = False
+        self.last_h5_reset = usage.h5_reset_epoch
+
+        if usage.h5_utilization >= 80.0 and not self.warned_80:
+            send_windows_toast("Alerta de Limite", f"Você já usou {usage.h5_utilization:.0f}% da sua cota de 5 horas. Vá com calma!")
+            play_sound("warning")
+            self.warned_80 = True
+        elif usage.h5_utilization < 80.0:
+            self.warned_80 = False
 
 def run_cli_loop(poll_interval: int = 120, manual_token: str = "") -> None:
     global keep_running, console_hwnd
@@ -517,9 +555,8 @@ def run_cli_loop(poll_interval: int = 120, manual_token: str = "") -> None:
     service = ServiceStatus()
     last_update_str = "--:--:--"
 
-    # Estados para acionar notificações
-    state_last_h5_reset = 0
-    state_warned_80 = False
+    alerts = UsageAlerts()
+    last_statusline_check = 0.0
 
     # Frame da animação do robozinho
     tick_counter = 0
@@ -564,6 +601,16 @@ def run_cli_loop(poll_interval: int = 120, manual_token: str = "") -> None:
                 # --- Frames de Animação para o caso "Vazio/Offline" ---
                 robot_frame = ROBOT_FRAMES[tick_counter % len(ROBOT_FRAMES)]
 
+                # Status line: local e gratuita, então é conferida a cada 5s em vez de
+                # esperar o intervalo da API. Só troca o uso se houver dado recente.
+                if now - last_statusline_check >= 5.0:
+                    last_statusline_check = now
+                    statusline_usage = monitor.read_statusline_usage()
+                    if statusline_usage:
+                        usage = statusline_usage
+                        last_update_str = datetime.fromtimestamp(usage.timestamp).strftime("%H:%M:%S")
+                        alerts.check(usage)
+
                 # Atualização periódica da API (Pesada, usa internet) — dispara em segundo plano
                 if not fetching and (now - last_api_time >= poll_interval or last_api_time == 0.0):
                     fetching = True
@@ -590,25 +637,8 @@ def run_cli_loop(poll_interval: int = 120, manual_token: str = "") -> None:
                         service = new_service
 
                     if usage.ok:
-                        last_update_str = datetime.now().strftime("%H:%M:%S")
-                        
-                        # ── LÓGICA DE NOTIFICAÇÕES E SONS DA API ──
-                        
-                        # 1. Reset da janela
-                        if state_last_h5_reset != 0 and usage.h5_reset_epoch > state_last_h5_reset:
-                            send_windows_toast("Claude Monitor", "Seu limite de 5 horas acabou de resetar! 🎉")
-                            play_sound("success")
-                            state_warned_80 = False
-                        state_last_h5_reset = usage.h5_reset_epoch
-
-                        # 2. Aviso de 80% de limite
-                        if usage.h5_utilization >= 80.0 and not state_warned_80:
-                            send_windows_toast("Alerta de Limite", f"Você já usou {usage.h5_utilization:.0f}% da sua cota de 5 horas. Vá com calma!")
-                            play_sound("warning")
-                            state_warned_80 = True
-                        elif usage.h5_utilization < 80.0:
-                            state_warned_80 = False
-
+                        last_update_str = datetime.fromtimestamp(usage.timestamp).strftime("%H:%M:%S")
+                        alerts.check(usage)
                         last_api_time = now
                     else:
                         # Falhou. Em vez de esperar 120s, espera só 10s pra tentar de novo.

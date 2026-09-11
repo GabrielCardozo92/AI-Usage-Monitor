@@ -19,10 +19,11 @@ Inspirado no projeto [Claude Usage Stick](https://github.com/benevid/claude-usag
 
 - **Tokens e Sessões do Claude Code**:
   - Lê os transcripts locais (`~/.claude/projects/**/*.jsonl`, incluindo subagentes) e mostra os tokens de entrada, saída e cache na janela de 5h.
-  - Lista cada sessão aberta com o modelo, o tamanho do contexto (com alerta quando cresce demais) e o estado: trabalhando (com cronômetro), aguardando você ou livre.
+  - Lista cada sessão aberta com o modelo, o contexto usado sobre a janela da sessão (ex.: `428k/1M`) e o estado: trabalhando (com cronômetro), aguardando você ou livre.
+  - Alerta de contexto calibrado pela janela: amarelo a partir de 300k ou 50% da janela, vermelho a partir de 600k ou 80% (o que vier primeiro).
 
 - **Saúde da API & Latência**:
-  - Latência da própria consulta de uso (Haiku), sem nenhuma requisição extra.
+  - De onde veio o uso exibido: status line do Claude Code (sem consulta à API) ou a própria API, com a latência da consulta.
   - Status de cada serviço (**Claude API**, **Claude Code**, **claude.ai**) e incidentes em aberto, lidos do `status.claude.com` — público, sem token e sem gastar cota.
 
 - **Integração com o Windows**:
@@ -57,6 +58,33 @@ python main.py --once
 
 ---
 
+## 📊 Status Line do Claude Code (recomendado)
+
+O Claude Code passa para a [status line](https://code.claude.com/docs/en/statusline) o uso de 5h/7d do seu plano (Pro/Max) e a janela de contexto de cada sessão. O `statusline.py` grava esses dados para o monitor e mostra uma linha compacta no rodapé de cada sessão:
+
+```
+5h 17% · 7d 16% · ctx 428k/1M (43%)
+```
+
+Para ativar, adicione ao `~/.claude/settings.json` (use barras normais no caminho):
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "python C:/caminho/para/claude-usage-monitor/statusline.py"
+  }
+}
+```
+
+Com ela ativa:
+- O uso vem do próprio Claude Code, **sem consultar a API** e sem gastar cota. A API só é consultada quando nenhuma sessão local respondeu nos últimos 5 minutos.
+- O alerta de contexto usa a janela exata de cada sessão (200k ou 1M).
+- Uso feito pelo claude.ai ou pelo celular só aparece na próxima resposta de uma sessão local (a consulta à API, quando usada, enxerga a conta inteira na hora).
+- Com uma status line personalizada, o Claude Code deixa de mostrar algumas dicas do rodapé, como "esc to interrupt" (os atalhos continuam funcionando).
+
+---
+
 ## 🔑 Autenticação Automática
 
 Você não precisa copiar nem colar tokens se já usa o Claude Code na sua máquina!
@@ -88,11 +116,14 @@ Crie um `config.json` na pasta do projeto para personalizar:
 
 ## 🧠 Como Funciona por Baixo dos Panos
 
-1. **Consulta Mínima à API**:
+1. **Fonte do Uso**:
+   Primeiro o monitor procura, em `statusline_data/`, o uso gravado pela status line do Claude Code nos últimos 5 minutos. Entre várias sessões, vale a leitura mais recente (dentro de uma janela o uso só cresce, então o maior percentual é o mais novo). Sem dado recente, ele consulta a API (itens 2 e 3).
+
+2. **Consulta Mínima à API** (reserva):
    O aplicativo envia uma requisição `POST` com `max_tokens: 1` para `https://api.anthropic.com/v1/messages` com o cabeçalho `anthropic-beta: oauth-2025-04-20` e o `User-Agent` do Claude Code.
    O corpo retornado é descartado — cada consulta consome apenas alguns tokens (cerca de 8 de entrada e 1 de saída).
 
-2. **Leitura dos Cabeçalhos Unificados**:
+3. **Leitura dos Cabeçalhos Unificados**:
    A Anthropic retorna o status e a utilização diretamente nos headers HTTP:
    - `anthropic-ratelimit-unified-5h-utilization`: uso da janela de 5 horas (0.0 a 1.0)
    - `anthropic-ratelimit-unified-5h-reset`: timestamp Unix do reset de 5 horas
@@ -101,8 +132,8 @@ Crie um `config.json` na pasta do projeto para personalizar:
    - `anthropic-ratelimit-unified-status`: `allowed`, `allowed_warning` ou `rejected`
    - `anthropic-ratelimit-unified-representative-claim`: `five_hour` ou `seven_day`
 
-3. **Contagem Local de Tokens**:
+4. **Contagem Local de Tokens**:
    Para saber quantos tokens foram consumidos de fato, o aplicativo faz o parsing dos arquivos `.jsonl` em `~/.claude/projects/` (incluindo os transcripts de subagentes) desde o início da janela de 5h (`reset - 5 horas`), somando input, output e cache.
 
-4. **Estado das Sessões**:
+5. **Estado das Sessões**:
    O status de cada sessão aberta vem de `~/.claude/sessions/*.json`, lido a cada segundo, o que permite notificar assim que uma tarefa termina.
