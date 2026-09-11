@@ -24,10 +24,12 @@ Inspirado no projeto [Claude Usage Stick](https://github.com/benevid/claude-usag
 
 - **Saúde da API & Latência**:
   - De onde veio o uso exibido: status line do Claude Code (sem consulta à API) ou a própria API, com a latência da consulta.
-  - Status de cada serviço (**Claude API**, **Claude Code**, **claude.ai**) e incidentes em aberto, lidos do `status.claude.com` — público, sem token e sem gastar cota.
+  - Status de cada serviço (**Claude API**, **Claude Code**, **claude.ai**, **Claude Cowork**) lido do `status.claude.com` — público, sem token e sem gastar cota.
+  - Incidentes em aberto com nome, serviço afetado e status (o mais grave, se houver vários).
+  - O nome do incidente é traduzido para português pelo próprio Claude Code (`claude -p` com Haiku), uma única vez por incidente, e guardado em `translations.json`. Sem o Claude Code disponível, o nome aparece em inglês.
 
 - **Integração com o Windows**:
-  - **Notificações nativas com som**: tarefa concluída, limite de 5h resetado, uso acima de 80% e novos incidentes.
+  - **Notificações nativas com som**: tarefa concluída, Claude aguardando você, limite de 5h resetado, uso acima de 80% e novos incidentes (com o nome do incidente).
   - **Ícone na bandeja do sistema**: ocultar/mostrar o terminal (duplo clique) e **Fixar no Topo**, que mantém o monitor visível mesmo após o Win+D.
 
 - **Relatório Rápido (`--once`)**: exibe os limites uma única vez no terminal e sai.

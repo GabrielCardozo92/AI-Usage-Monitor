@@ -16,6 +16,7 @@ from rich.align import Align
 from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -427,28 +428,37 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
 
     # Latência & Status dos serviços (status.claude.com)
     health_table = Table.grid(expand=True, padding=(0, 1))
-    health_table.add_column(style="dim white", width=12)
-    health_table.add_column(style="bold white")
+    health_table.add_column(style="dim white", width=14, min_width=14, no_wrap=True)
+    # O painel tem altura fixa: texto longo é cortado com "…" em vez de quebrar a linha.
+    # ratio=1 faz esta coluna ficar só com o espaço restante, sem espremer a de nomes.
+    health_table.add_column(style="bold white", ratio=1, no_wrap=True, overflow="ellipsis")
 
     if not usage.ok:
         health_table.add_row("Fonte:", "[dim]--[/dim]")
     elif usage.source == "status line":
         age = max(0, int(time.time() - usage.timestamp))
-        health_table.add_row("Fonte:", f"[bold white]Status line[/] [dim](há {age}s, sem consulta à API)[/dim]")
+        health_table.add_row("Fonte:", f"[bold white]Status line do Claude Code[/] [dim]· há {age}s[/dim]")
     else:
-        health_table.add_row("Fonte:", f"[bold white]API[/] [dim]({usage.latency_ms}ms, Haiku)[/dim]")
+        health_table.add_row("Fonte:", f"[bold white]API[/] [dim]· {usage.latency_ms}ms (Haiku)[/dim]")
 
     if service.ok:
         for name, status in service.components:
             label, color = monitor.component_status_display(status)
             health_table.add_row(f"{name}:", f"[bold {color}]{label}[/]")
-        if service.incidents:
-            health_table.add_row("Incidentes:", f"[bold red]{len(service.incidents)} ativo(s)[/]")
+        worst = service.worst_incident()
+        if worst:
+            count = len(service.incidents)
+            where = escape(", ".join(worst.components) or "serviço não informado")
+            health_table.add_row(
+                "Incidentes:",
+                f"[bold red]{count} ativo{'s' if count > 1 else ''}[/] [dim]· {where} · {worst.status_display}[/dim]"
+            )
+            prefix = "mais grave: " if count > 1 else ""
+            health_table.add_row("", f"[red]⚠ {prefix}{escape(worst.display_name)}[/]")
         else:
             health_table.add_row("Incidentes:", "[bold green]Nenhum[/]")
     else:
         health_table.add_row("Status:", "[dim]status.claude.com indisponível[/dim]")
-    health_table.add_row("Bandeja:", "[dim]Rodando... (Duplo clique no relógio)[/dim]")
 
     status_panel = Panel(
         health_table,
@@ -501,6 +511,11 @@ def fetch_api_data(monitor: ClaudeMonitor, manual_token: str):
         service = monitor.fetch_service_status()
     except Exception:
         service = ServiceStatus()
+    try:
+        # Roda aqui, fora da tela: um nome novo leva alguns segundos para traduzir
+        monitor.translate_incidents(service)
+    except Exception:
+        pass  # Sem tradução, o nome aparece em inglês
     return usage, service
 
 class UsageAlerts:
@@ -631,8 +646,18 @@ def run_cli_loop(poll_interval: int = 120, manual_token: str = "") -> None:
                     # Só atualiza se o status page respondeu: uma falha de rede não pode
                     # zerar a contagem de incidentes e depois realertar os mesmos.
                     if new_service.ok:
-                        if len(new_service.incidents) > len(service.incidents):
-                            send_windows_toast("Incidente Anthropic", "Problema reportado nos servidores do Claude. Pode haver lentidão.")
+                        # Compara por id: um incidente resolvido e outro aberto na mesma
+                        # consulta mantêm a contagem, mas o novo ainda precisa de aviso.
+                        known = {i.id for i in service.incidents}
+                        new = [i for i in new_service.incidents if i.id not in known]
+                        if new:
+                            first = new[0]
+                            msg = first.display_name
+                            if first.components:
+                                msg += f" ({', '.join(first.components)})"
+                            if len(new) > 1:
+                                msg += f" e mais {len(new) - 1}"
+                            send_windows_toast("Incidente na Anthropic", msg)
                             play_sound("error")
                         service = new_service
 

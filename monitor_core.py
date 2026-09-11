@@ -7,6 +7,8 @@ e da saúde dos serviços pelo status.claude.com.
 import glob
 import json
 import os
+import shutil
+import subprocess
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -14,7 +16,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import requests
-from config import CLAUDE_DIR, PROJECTS_DIR, STATUSLINE_DIR
+from config import APP_DIR, CLAUDE_DIR, PROJECTS_DIR, STATUSLINE_DIR, TRANSLATIONS_FILE
 
 MESSAGES_ENDPOINT = "https://api.anthropic.com/v1/messages"
 STATUS_ENDPOINT = "https://status.claude.com/api/v2/summary.json"
@@ -31,7 +33,17 @@ WATCHED_COMPONENTS = [
     ("Claude API", "Claude API"),
     ("Claude Code", "Claude Code"),
     ("claude.ai", "claude.ai"),
+    ("Claude Cowork", "Claude Cowork"),
 ]
+
+# Status e impacto de incidentes do status page, traduzidos para exibição
+INCIDENT_STATUS = {
+    "investigating": "investigando",
+    "identified": "identificado",
+    "monitoring": "monitorando",
+    "resolved": "resolvido",
+}
+INCIDENT_IMPACT_ORDER = {"none": 0, "minor": 1, "major": 2, "critical": 3}
 
 # Status de componente do status page -> (texto, cor)
 COMPONENT_STATUS = {
@@ -101,6 +113,17 @@ class Incident:
     status: str
     impact: str
     created_at: str
+    id: str = ""
+    components: List[str] = field(default_factory=list)  # Serviços afetados
+    name_pt: str = ""                    # Tradução do nome; vazio enquanto não traduzido
+
+    @property
+    def status_display(self) -> str:
+        return INCIDENT_STATUS.get(self.status, self.status)
+
+    @property
+    def display_name(self) -> str:
+        return self.name_pt or self.name
 
 @dataclass
 class ServiceStatus:
@@ -108,6 +131,69 @@ class ServiceStatus:
     components: List[Tuple[str, str]] = field(default_factory=list)  # (nome exibido, status bruto)
     incidents: List[Incident] = field(default_factory=list)
     ok: bool = False
+
+    def worst_incident(self) -> Optional[Incident]:
+        """O incidente de maior impacto (o primeiro listado em caso de empate)."""
+        return max(self.incidents, key=lambda i: INCIDENT_IMPACT_ORDER.get(i.impact, 0), default=None)
+
+class IncidentTranslator:
+    """
+    Traduz nomes de incidentes para português com o próprio Claude Code (claude -p, Haiku).
+    Cada texto é traduzido uma única vez e guardado em TRANSLATIONS_FILE.
+    """
+    SYSTEM_PROMPT = (
+        "Você traduz títulos de incidentes de uma página de status do inglês para o português "
+        "do Brasil. Responda somente com a tradução, em uma linha, sem aspas nem comentários. "
+        "Não traduza nomes de produtos: Claude, Claude Code, Claude Cowork, claude.ai, Claude API, Console."
+    )
+    RETRY_AFTER_SEC = 600  # Após uma falha (sem internet, Claude Code ausente...), espera para tentar de novo
+
+    def __init__(self):
+        try:
+            self._cache: Dict[str, str] = json.loads(TRANSLATIONS_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self._cache = {}
+        self._failed_at: Dict[str, float] = {}
+
+    def translate(self, text: str) -> Optional[str]:
+        """Tradução do texto, ou None se não for possível agora. Bloqueia alguns segundos na 1ª vez."""
+        if text in self._cache:
+            return self._cache[text]
+        if time.time() - self._failed_at.get(text, 0) < self.RETRY_AFTER_SEC:
+            return None
+        result = self._run_claude(text)
+        if result is None:
+            self._failed_at[text] = time.time()
+            return None
+        self._cache[text] = result
+        try:
+            TRANSLATIONS_FILE.write_text(json.dumps(self._cache, ensure_ascii=False, indent=1), encoding="utf-8")
+        except OSError:
+            pass
+        return result
+
+    def _run_claude(self, text: str) -> Optional[str]:
+        exe = shutil.which("claude")
+        if not exe:
+            return None
+        try:
+            # O título vem da internet: vai pelo stdin, nunca na linha de comando
+            # (no Windows o claude é um .cmd, e o cmd.exe interpretaria & | ^ %)
+            r = subprocess.run(
+                [exe, "-p", "Traduza o título recebido pela entrada padrão.",
+                 "--model", "haiku", "--no-session-persistence", "--tools", "",
+                 "--system-prompt", self.SYSTEM_PROMPT],
+                input=text, capture_output=True, text=True, encoding="utf-8", timeout=90,
+                cwd=str(APP_DIR), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        lines = r.stdout.strip().splitlines()
+        result = lines[0].strip().strip('"') if lines else ""
+        # Resposta vazia, erro ou longa demais para ser só a tradução: descarta
+        if r.returncode != 0 or not result or len(result) > 3 * len(text) + 20:
+            return None
+        return result
 
 # (timestamp, id da mensagem, tokens de entrada, de saída, de leitura de cache)
 UsageRecord = Tuple[float, Optional[str], int, int, int]
@@ -167,6 +253,7 @@ class ClaudeMonitor:
         self._session_log_paths: Dict[str, Path] = {}   # sessionId -> transcript
         self._session_log_sizes: Dict[str, int] = {}    # sessionId -> tamanho já analisado
         self._transcripts: Dict[str, _TranscriptCache] = {}
+        self.translator = IncidentTranslator()
 
     def fetch_usage(self, token: str) -> UsageData:
         """
@@ -260,11 +347,19 @@ class ClaudeMonitor:
                 name=inc.get("name", "Incidente Desconhecido"),
                 status=inc.get("status", "unknown"),
                 impact=inc.get("impact", "none"),
-                created_at=inc.get("created_at", "")
+                created_at=inc.get("created_at", ""),
+                id=inc.get("id", ""),
+                # "Claude API (api.anthropic.com)" -> "Claude API"
+                components=[c.get("name", "").split(" (")[0] for c in inc.get("components", [])]
             )
             for inc in data.get("incidents", [])
         ]
         return ServiceStatus(components=components, incidents=incidents, ok=True)
+
+    def translate_incidents(self, service: ServiceStatus) -> None:
+        """Preenche name_pt dos incidentes (lento na 1ª vez de cada nome: rode fora da tela)."""
+        for inc in service.incidents:
+            inc.name_pt = self.translator.translate(inc.name) or ""
 
     @staticmethod
     def component_status_display(status: str) -> Tuple[str, str]:
@@ -289,6 +384,10 @@ class ClaudeMonitor:
                 continue
             pid = data.get("pid")
             if not pid:
+                continue
+            # Execuções não interativas (claude -p, Agent SDK), como as traduções do
+            # próprio monitor, também registram sessão, mas não são um terminal em uso
+            if data.get("entrypoint") == "sdk-cli":
                 continue
 
             cwd = data.get("cwd", "")
