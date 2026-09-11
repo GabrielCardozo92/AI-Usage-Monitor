@@ -1,21 +1,16 @@
 """
 cli_view.py - Dashboard em modo terminal utilizando a biblioteca Rich.
 Ideal para quem gosta de deixar o monitor rodando em um terminal ao lado do código.
+Executado a partir do main.py.
 """
 import sys
 import os
 import time
+import queue
 import subprocess
 import winsound
 import threading
 from datetime import datetime
-
-# Garantir UTF-8 no terminal Windows
-if sys.platform == "win32":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
 
 from rich.align import Align
 from rich.console import Console
@@ -26,82 +21,154 @@ from rich.table import Table
 from rich.text import Text
 
 from config import get_claude_token
-from monitor_core import ClaudeMonitor, UsageData, TokenUsage
+from monitor_core import ClaudeMonitor, ClaudeSession, ServiceStatus, UsageData, TokenUsage
 
 console = Console(legacy_windows=False)
+
+ROBOT_FRAMES = ["( 🤖 ) zZ ", "( 🤖 )  zZ", "( 🤖 )   z"]
 
 # ---- CONFIGURAÇÕES DA BANDEJA DO SISTEMA (SYSTEM TRAY) ----
 tray_icon = None
 is_hidden = False
 is_topmost = False
 keep_running = True
+console_hwnd = None  # Janela que hospeda este terminal, localizada uma única vez
 
-def get_real_hwnd():
+# Constantes Win32
+HWND_TOPMOST = -1
+HWND_NOTOPMOST = -2
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+SW_HIDE = 0
+SW_SHOW = 5
+SW_RESTORE = 9
+GA_ROOTOWNER = 3
+
+_user32 = None
+
+def get_user32():
+    """user32 com assinaturas declaradas (HWND de 64 bits não pode ser truncado para int)."""
+    global _user32
+    if _user32 is None:
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.WinDLL("user32")
+        u.IsWindowVisible.argtypes = [wintypes.HWND]
+        u.IsIconic.argtypes = [wintypes.HWND]
+        u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        u.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_int, ctypes.c_int, wintypes.UINT]
+        u.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        u.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        u.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        u.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        u.GetAncestor.restype = wintypes.HWND
+        _user32 = u
+    return _user32
+
+def find_console_window():
+    """
+    Localiza a janela visível que hospeda este console (conhost clássico ou Windows Terminal).
+    Retorna None se não encontrar — nunca cai para a janela em foco, senão o
+    'Fixar no Topo' acabaria fixando uma janela qualquer do usuário.
+    """
     import ctypes
-    hw = ctypes.windll.kernel32.GetConsoleWindow()
-    if ctypes.windll.user32.IsWindowVisible(hw):
-        return hw
-    
-    found_hwnd = 0
-    EnumWindows = ctypes.windll.user32.EnumWindows
-    EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int))
-    GetWindowText = ctypes.windll.user32.GetWindowTextW
-    GetWindowTextLength = ctypes.windll.user32.GetWindowTextLengthW
-    
-    def foreach_window(h, lParam):
-        nonlocal found_hwnd
-        length = GetWindowTextLength(h)
+    from ctypes import wintypes
+
+    user32 = get_user32()
+    kernel32 = ctypes.WinDLL("kernel32")
+    kernel32.GetConsoleWindow.restype = wintypes.HWND
+    kernel32.SetConsoleTitleW.argtypes = [wintypes.LPCWSTR]
+
+    hwnd = kernel32.GetConsoleWindow()
+    if hwnd:
+        # No Windows Terminal, GetConsoleWindow devolve uma pseudo-janela de tamanho 0
+        # (classe PseudoConsoleWindow) cujo dono é a janela real do terminal.
+        owner = user32.GetAncestor(hwnd, GA_ROOTOWNER)
+        if owner and owner != hwnd and user32.IsWindowVisible(owner):
+            return owner
+
+        class_buf = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(hwnd, class_buf, 64)
+        if class_buf.value != "PseudoConsoleWindow" and user32.IsWindowVisible(hwnd):
+            return hwnd  # conhost clássico
+
+    # Versões antigas do Windows Terminal não definem o dono da pseudo-janela.
+    # Definimos um título único e procuramos a janela do terminal que passa a exibi-lo.
+    title = f"Claude Usage Monitor [{os.getpid()}]"
+    kernel32.SetConsoleTitleW(title)
+
+    EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    found = []
+
+    def foreach_window(h, _):
+        if not user32.IsWindowVisible(h):
+            return True
+        length = user32.GetWindowTextLengthW(h)
         buff = ctypes.create_unicode_buffer(length + 1)
-        GetWindowText(h, buff, length + 1)
-        if "Claude Usage Monitor" in buff.value or "WindowsTerminal" in buff.value:
-            found_hwnd = h
+        user32.GetWindowTextW(h, buff, length + 1)
+        if buff.value == title:
+            found.append(h)
             return False
         return True
-    
-    EnumWindows(EnumWindowsProc(foreach_window), 0)
-    
-    if found_hwnd:
-        return found_hwnd
-        
-    return ctypes.windll.user32.GetForegroundWindow()
+
+    callback = EnumWindowsProc(foreach_window)
+    # O terminal propaga o novo título de forma assíncrona
+    for _ in range(30):
+        user32.EnumWindows(callback, 0)
+        if found:
+            return found[0]
+        time.sleep(0.1)
+    return None
+
+def set_topmost(hwnd, on: bool):
+    flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+    get_user32().SetWindowPos(hwnd, HWND_TOPMOST if on else HWND_NOTOPMOST, 0, 0, 0, 0, flags)
 
 def setup_system_tray():
     if sys.platform != "win32":
         return
-        
+
     try:
-        import ctypes
         import pystray
         from PIL import Image, ImageDraw
 
-        hwnd = get_real_hwnd()
+        user32 = get_user32()
+        hwnd = console_hwnd
+        not_found_msg = "Não foi possível localizar a janela do terminal."
 
         def toggle_window(icon, item):
             global is_hidden
+            if not hwnd:
+                icon.notify(not_found_msg)
+                return
             if is_hidden:
-                ctypes.windll.user32.ShowWindow(hwnd, 5) # SW_SHOW
+                user32.ShowWindow(hwnd, SW_SHOW)
                 is_hidden = False
                 icon.notify("Terminal exibido novamente.")
             else:
-                ctypes.windll.user32.ShowWindow(hwnd, 0) # SW_HIDE
+                user32.ShowWindow(hwnd, SW_HIDE)
                 is_hidden = True
                 icon.notify("Rodando em segundo plano...")
 
         def toggle_topmost(icon, item):
             global is_topmost
+            if not hwnd:
+                icon.notify(not_found_msg)
+                return
             is_topmost = not is_topmost
+            set_topmost(hwnd, is_topmost)
             if is_topmost:
-                ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0003)
                 icon.notify("Sempre no topo: ATIVADO. (Sobrevive ao Win+D)")
             else:
-                ctypes.windll.user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0, 0x0003)
                 icon.notify("Sempre no topo: DESATIVADO.")
 
         def quit_app(icon, item):
             global keep_running
             keep_running = False
-            if is_hidden:
-                ctypes.windll.user32.ShowWindow(hwnd, 5)
+            if is_hidden and hwnd:
+                user32.ShowWindow(hwnd, SW_SHOW)
             icon.stop()
 
         # Criar ícone simples (Quadrado Laranja)
@@ -118,7 +185,7 @@ def setup_system_tray():
         global tray_icon
         tray_icon = pystray.Icon("Claude Monitor", img, "Claude Usage Monitor", menu)
         tray_icon.run()
-    except Exception as e:
+    except Exception:
         pass
 
 def send_windows_toast(title: str, message: str):
@@ -126,17 +193,21 @@ def send_windows_toast(title: str, message: str):
     if sys.platform != "win32":
         return
     
-    ps_script = f'''
+    # Os textos vão por variável de ambiente, nunca interpolados no script:
+    # um nome de pasta como "$(comando)" seria executado pelo PowerShell.
+    ps_script = '''
     [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
     $template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
     $textNodes = $template.GetElementsByTagName("text")
-    $textNodes.Item(0).AppendChild($template.CreateTextNode("{title}")) | Out-Null
-    $textNodes.Item(1).AppendChild($template.CreateTextNode("{message}")) | Out-Null
+    $textNodes.Item(0).AppendChild($template.CreateTextNode($env:CLAUDE_MONITOR_TOAST_TITLE)) | Out-Null
+    $textNodes.Item(1).AppendChild($template.CreateTextNode($env:CLAUDE_MONITOR_TOAST_MSG)) | Out-Null
     $toast = [Windows.UI.Notifications.ToastNotification]::new($template)
     [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("Claude Monitor").Show($toast)
     '''
+    env = {**os.environ, "CLAUDE_MONITOR_TOAST_TITLE": title, "CLAUDE_MONITOR_TOAST_MSG": message}
     try:
-        subprocess.Popen(["powershell", "-Command", ps_script], creationflags=subprocess.CREATE_NO_WINDOW)
+        subprocess.Popen(["powershell", "-NoProfile", "-Command", ps_script],
+                         env=env, creationflags=subprocess.CREATE_NO_WINDOW)
     except Exception:
         pass
 
@@ -144,15 +215,22 @@ def play_sound(sound_type: str):
     """Toca sons nativos do Windows de acordo com a severidade."""
     if sys.platform != "win32":
         return
+    alias = {"success": "SystemAsterisk", "warning": "SystemExclamation", "error": "SystemHand"}.get(sound_type)
+    if not alias:
+        return
     try:
-        if sound_type == "success":
-            winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC)
-        elif sound_type == "warning":
-            winsound.PlaySound("SystemExclamation", winsound.SND_ALIAS | winsound.SND_ASYNC)
-        elif sound_type == "error":
-            winsound.PlaySound("SystemHand", winsound.SND_ALIAS | winsound.SND_ASYNC)
+        winsound.PlaySound(alias, winsound.SND_ALIAS | winsound.SND_ASYNC)
     except Exception:
         pass
+
+def is_waiting(s: ClaudeSession) -> bool:
+    """Sessão parada esperando o usuário (autorização, pergunta...)."""
+    # Versões antigas do Claude Code não usam "waiting": ficam "idle" com a última
+    # resposta parada num tool_use, esperando a autorização da ferramenta.
+    return s.status == "waiting" or (s.status == "idle" and s.last_stop_reason == "tool_use")
+
+def waiting_reason(s: ClaudeSession) -> str:
+    return s.waiting_for or "Autorização"
 
 def get_color_for_pct(pct: float) -> str:
     if pct < 50:
@@ -172,8 +250,11 @@ def make_gauge_bar(pct: float, total_bars: int = 24) -> Text:
     return t
 
 def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage,
-                    probes: list, incidents: list, last_update_str: str,
-                    next_refresh_sec: int, active_sessions: dict, robot_frame: str) -> Layout:
+                    service: ServiceStatus, last_update_str: str,
+                    next_refresh_text: str, active_sessions: dict, robot_frame: str) -> Layout:
+    # UsageData() vazio (sem erro) = a primeira consulta ainda não voltou
+    loading = not usage.ok and not usage.error_msg
+
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=3),
@@ -186,6 +267,7 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
     title_text = Text.assemble(
         (" ✦ CLAUDE USAGE MONITOR ", "bold #D97757"),
         ("· Terminal Edition ", "bold white"),
+        ("[CONECTANDO]", "bold yellow") if loading else
         (f"[{'ONLINE' if usage.ok else 'ERRO'}]", "bold green" if usage.ok else "bold red")
     )
     header_panel = Panel(
@@ -210,9 +292,11 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
     proj_text, proj_color = monitor.get_projection_text(usage.h5_utilization, usage.h5_reset_epoch)
 
     h5_content = Text()
-    
-    if not usage.ok:
-        h5_content.append(f"\n   [FALHA DE COMUNICAÇÃO]\n", style="bold red")
+
+    if loading:
+        h5_content.append("\n   Consultando a API da Anthropic...\n", style="dim white")
+    elif not usage.ok:
+        h5_content.append("\n   [FALHA DE COMUNICAÇÃO]\n", style="bold red")
         h5_content.append(f"   {usage.error_msg}\n\n", style="dim red")
         h5_content.append("   O monitor tentará reconectar\n   automaticamente em 10 segundos...", style="dim white")
     else:
@@ -243,8 +327,10 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
     d7_reset_time = datetime.fromtimestamp(usage.d7_reset_epoch).strftime("%d/%m %H:%M") if usage.d7_reset_epoch else "--:--"
 
     d7_content = Text()
-    if not usage.ok:
-        d7_content.append(f"\n   [DADOS INDISPONÍVEIS]\n", style="bold red")
+    if loading:
+        d7_content.append("\n   Consultando a API da Anthropic...\n", style="dim white")
+    elif not usage.ok:
+        d7_content.append("\n   [DADOS INDISPONÍVEIS]\n", style="bold red")
         d7_content.append("   Sem conexão com Anthropic API.\n", style="dim white")
     else:
         d7_content.append(f"\n   {usage.d7_utilization:.0f}%\n", style=f"bold {d7_color}")
@@ -267,7 +353,7 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
     )
     layout["d7_panel"].update(d7_panel)
 
-    # ── Detalhes (Tokens Locais & Status Modelos) ─────────────
+    # ── Detalhes (Tokens Locais & Saúde da API) ───────────────
     layout["details"].split_row(
         Layout(name="tokens_panel", ratio=1),
         Layout(name="status_panel", ratio=1)
@@ -286,13 +372,13 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
     mascot_text.append("\n")
     if not active_sessions:
         mascot_text.append(f" {robot_frame} ", style="bold cyan")
-        mascot_text.append(" [dim]Nenhum terminal rodando Claude...[/dim]")
+        mascot_text.append(" Nenhum terminal rodando Claude...", style="dim")
     else:
-        for pid, s in active_sessions.items():
+        for s in active_sessions.values():
             folder_name = s.name
             if len(folder_name) > 15:
                 folder_name = folder_name[:12] + "..."
-                
+
             # Formatação do Contexto (Avisos de tamanho)
             ctx_str = f"[{monitor.format_tokens(s.context_tokens)} ctx]"
             if s.context_tokens > 600000:
@@ -302,36 +388,23 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
                 ctx_style = "bold yellow"
             else:
                 ctx_style = "dim white"
-                
-            model_display = ""
-            if s.model:
-                clean_m = s.model.replace("claude-", "").title()
-                model_display = f"[{clean_m}] "
-                
+
             if s.status == "busy":
                 # Calcula o tempo decorrido
                 elapsed = max(0, int(time.time() - s.status_updated_at)) if s.status_updated_at > 0 else 0
                 m, sec = divmod(elapsed, 60)
-                timer_str = f"{m:02d}:{sec:02d}"
-                
-                mascot_text.append(" ✍️  ", style="bold yellow")
-                mascot_text.append(f"{folder_name} ", style="bold white")
-                if model_display: mascot_text.append(model_display, style="dim cyan")
-                mascot_text.append(f"{ctx_str} ", style=ctx_style)
-                mascot_text.append(f"(Trabalhando... {timer_str})\n", style="bold yellow")
-            elif s.status == "waiting" or (s.status == "idle" and s.last_stop_reason == "tool_use"):
-                reason = "Autorização" if not s.waiting_for else s.waiting_for
-                mascot_text.append(" ⏳  ", style="bold magenta")
-                mascot_text.append(f"{folder_name} ", style="bold white")
-                if model_display: mascot_text.append(model_display, style="dim cyan")
-                mascot_text.append(f"{ctx_str} ", style=ctx_style)
-                mascot_text.append(f"(Aguardando você - {reason})\n", style="bold magenta")
+                icon, state, style = "✍️", f"Trabalhando... {m:02d}:{sec:02d}", "bold yellow"
+            elif is_waiting(s):
+                icon, state, style = "⏳", f"Aguardando você - {waiting_reason(s)}", "bold magenta"
             else:
-                mascot_text.append(" ✨  ", style="bold green")
-                mascot_text.append(f"{folder_name} ", style="bold white")
-                if model_display: mascot_text.append(model_display, style="dim cyan")
-                mascot_text.append(f"{ctx_str} ", style=ctx_style)
-                mascot_text.append("(Livre)\n", style="bold green")
+                icon, state, style = "✨", "Livre", "bold green"
+
+            mascot_text.append(f" {icon}  ", style=style)
+            mascot_text.append(f"{folder_name} ", style="bold white")
+            if s.model:
+                mascot_text.append(f"[{s.model.replace('claude-', '').title()}] ", style="dim cyan")
+            mascot_text.append(f"{ctx_str} ", style=ctx_style)
+            mascot_text.append(f"({state})\n", style=style)
 
     tokens_content = Layout()
     tokens_content.split_column(
@@ -346,35 +419,30 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
     )
     layout["tokens_panel"].update(tokens_panel)
 
-    # Modelos & Incidentes
-    models_table = Table.grid(expand=True, padding=(0, 1))
-    models_table.add_column(style="dim white", width=12)
-    models_table.add_column(style="bold white")
+    # Latência & Status dos serviços (status.claude.com)
+    health_table = Table.grid(expand=True, padding=(0, 1))
+    health_table.add_column(style="dim white", width=12)
+    health_table.add_column(style="bold white")
 
-    if probes:
-        for p in probes:
-            if p.status_code == 200:
-                status_style = "bold green"
-                lat_str = f"{p.latency_ms}ms"
-            elif p.status_code == 429:
-                status_style = "bold yellow"
-                lat_str = "LIMITADO (429)"
-            else:
-                status_style = "bold red"
-                lat_str = f"ERRO ({p.status_code})"
-            models_table.add_row(f"{p.display_name}:", f"[{status_style}]{lat_str}[/]")
+    if usage.ok:
+        health_table.add_row("Latência:", f"[bold white]{usage.latency_ms}ms[/] [dim](Haiku)[/dim]")
     else:
-        models_table.add_row("Sonda:", "[dim]Desativada nas configs[/dim]")
+        health_table.add_row("Latência:", "[dim]--[/dim]")
 
-    if incidents:
-        models_table.add_row("Incidentes:", f"[bold red]{len(incidents)} ativo(s)[/]")
+    if service.ok:
+        for name, status in service.components:
+            label, color = monitor.component_status_display(status)
+            health_table.add_row(f"{name}:", f"[bold {color}]{label}[/]")
+        if service.incidents:
+            health_table.add_row("Incidentes:", f"[bold red]{len(service.incidents)} ativo(s)[/]")
+        else:
+            health_table.add_row("Incidentes:", "[bold green]Nenhum[/]")
     else:
-        models_table.add_row("Incidentes:", "[bold green]Nenhum (status.claude.com OK)[/]")
-    models_table.add_row("", "")
-    models_table.add_row("Bandeja:", "[dim]Rodando... (Duplo clique no relógio)[/dim]")
+        health_table.add_row("Status:", "[dim]status.claude.com indisponível[/dim]")
+    health_table.add_row("Bandeja:", "[dim]Rodando... (Duplo clique no relógio)[/dim]")
 
     status_panel = Panel(
-        models_table,
+        health_table,
         title="[bold white]Saúde da API & Latência[/bold white]",
         border_style="#D97757"
     )
@@ -385,7 +453,7 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
         ("Atualizado às ", "dim white"),
         (last_update_str, "bold cyan"),
         (" · Próxima consulta em ", "dim white"),
-        (f"{next_refresh_sec}s", "bold yellow"),
+        (next_refresh_text, "bold yellow"),
         (" · Pressione ", "dim white"),
         ("Ctrl+C", "bold red"),
         (" para sair (Ou oculte na bandeja)", "dim white")
@@ -399,21 +467,44 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
 
     return layout
 
-def run_cli_loop(poll_interval: int = 120, probe_models: bool = True) -> None:
-    global keep_running
+def fetch_api_data(monitor: ClaudeMonitor, manual_token: str):
+    """
+    Consulta a API em segundo plano (roda fora do loop da tela).
+    Nunca levanta exceção: qualquer falha vira um UsageData/ServiceStatus com ok=False.
+    Retorna (usage, service).
+    """
+    try:
+        # Relê o token a cada consulta: o Claude Code renova o access token
+        # periodicamente e o antigo passa a devolver 401.
+        token, _ = get_claude_token(manual_token)
+        if token:
+            usage = monitor.fetch_usage(token)
+        else:
+            usage = UsageData(ok=False, error_msg="Nenhum token do Claude encontrado")
+    except Exception as e:
+        usage = UsageData(ok=False, error_msg=f"Erro inesperado: {e}")
+    # O status page é consultado mesmo se a API falhar: é justamente quando ele explica o porquê
+    try:
+        service = monitor.fetch_service_status()
+    except Exception:
+        service = ServiceStatus()
+    return usage, service
 
-    token, origin = get_claude_token()
+def run_cli_loop(poll_interval: int = 120, manual_token: str = "") -> None:
+    global keep_running, console_hwnd
+
+    token, origin = get_claude_token(manual_token)
     if not token:
         console.print("[bold red]Erro:[/] Nenhum token do Claude encontrado!")
         console.print("Faça login com o Claude Code ('claude setup-token' ou 'claude') ou defina $CLAUDE_CODE_OAUTH_TOKEN.")
         sys.exit(1)
 
     console.print(f"[dim]Autenticado via: {origin}[/dim]")
-    
+
     # Inicia a thread da Bandeja do Sistema (System Tray)
     if sys.platform == "win32":
-        tray_thread = threading.Thread(target=setup_system_tray, daemon=True)
-        tray_thread.start()
+        console_hwnd = find_console_window()
+        threading.Thread(target=setup_system_tray, daemon=True).start()
         time.sleep(0.5)
         send_windows_toast("Claude Monitor", "Estou rodando! Clique no ícone perto do relógio para Ocultar/Mostrar a tela preta.")
 
@@ -423,22 +514,24 @@ def run_cli_loop(poll_interval: int = 120, probe_models: bool = True) -> None:
     last_local_time = 0.0
     usage = UsageData()
     tokens = TokenUsage()
-    probes = []
-    incidents = []
+    service = ServiceStatus()
     last_update_str = "--:--:--"
 
     # Estados para acionar notificações
     state_last_h5_reset = 0
     state_warned_80 = False
-    state_last_incidents = 0
-    
-    # Estados do Robozinho / Fast Polling
-    last_output_tokens = 0
+
+    # Frame da animação do robozinho
     tick_counter = 0
-    
+
     # Controle Exato de Status (via sessões do Claude Code)
     last_sessions = {}
-    
+
+    # A consulta à API roda numa thread e entrega o resultado por esta fila,
+    # para a tela, as sessões e o "Fixar no Topo" não congelarem durante a rede.
+    api_results = queue.Queue()
+    fetching = False
+
     with Live(console=console, screen=True, auto_refresh=False) as live:
         try:
             while keep_running:
@@ -448,33 +541,55 @@ def run_cli_loop(poll_interval: int = 120, probe_models: bool = True) -> None:
                 current_sessions = monitor.get_claude_sessions()
                 
                 for pid, sess in current_sessions.items():
-                    if pid in last_sessions:
-                        prev_sess = last_sessions[pid]
-                        if prev_sess.status == "busy" and sess.status == "idle":
-                            # Acabou de terminar uma tarefa nessa sessão!
-                            send_windows_toast(f"Tarefa Concluída: {sess.name}", "O Claude terminou o processo e aguarda comando.")
-                            play_sound("success")
+                    prev_sess = last_sessions.get(pid)
+                    if not prev_sess:
+                        continue
+                    if is_waiting(sess) and not is_waiting(prev_sess):
+                        # Parou no meio da tarefa esperando o usuário (autorização, pergunta...)
+                        send_windows_toast(f"Claude aguardando você: {sess.name}", f"Motivo: {waiting_reason(sess)}")
+                        play_sound("warning")
+                    elif prev_sess.status == "busy" and sess.status != "busy" and not is_waiting(sess):
+                        # Acabou de terminar uma tarefa nessa sessão! O status final pode ser
+                        # "idle" ou "shell" (ocioso, mas com um comando rodando em segundo plano).
+                        send_windows_toast(f"Tarefa Concluída: {sess.name}", "O Claude terminou o processo e aguarda comando.")
+                        play_sound("success")
                 
                 last_sessions = current_sessions
                 
                 # Polling de Tokens (A cada 3 segundos)
                 if now - last_local_time >= 3.0:
-                    new_tokens = monitor.collect_local_tokens(usage.h5_reset_epoch)
-                    last_output_tokens = new_tokens.output_tokens
-                    tokens = new_tokens
+                    tokens = monitor.collect_local_tokens(usage.h5_reset_epoch)
                     last_local_time = now
 
                 # --- Frames de Animação para o caso "Vazio/Offline" ---
-                frames = ["( 🤖 ) zZ ", "( 🤖 )  zZ", "( 🤖 )   z"]
-                robot_frame = frames[tick_counter % len(frames)]
+                robot_frame = ROBOT_FRAMES[tick_counter % len(ROBOT_FRAMES)]
 
-                # Atualização periódica da API (Pesada, usa internet)
-                if now - last_api_time >= poll_interval or last_api_time == 0.0:
-                    usage = monitor.fetch_usage(token)
+                # Atualização periódica da API (Pesada, usa internet) — dispara em segundo plano
+                if not fetching and (now - last_api_time >= poll_interval or last_api_time == 0.0):
+                    fetching = True
+                    threading.Thread(
+                        target=lambda: api_results.put(fetch_api_data(monitor, manual_token)),
+                        daemon=True
+                    ).start()
+
+                # Resultado da consulta chegou?
+                try:
+                    usage, new_service = api_results.get_nowait()
+                except queue.Empty:
+                    pass
+                else:
+                    fetching = False
+                    now = time.time()
+
+                    # Só atualiza se o status page respondeu: uma falha de rede não pode
+                    # zerar a contagem de incidentes e depois realertar os mesmos.
+                    if new_service.ok:
+                        if len(new_service.incidents) > len(service.incidents):
+                            send_windows_toast("Incidente Anthropic", "Problema reportado nos servidores do Claude. Pode haver lentidão.")
+                            play_sound("error")
+                        service = new_service
+
                     if usage.ok:
-                        if probe_models:
-                            probes = monitor.probe_models(token)
-                        incidents = monitor.fetch_incidents()
                         last_update_str = datetime.now().strftime("%H:%M:%S")
                         
                         # ── LÓGICA DE NOTIFICAÇÕES E SONS DA API ──
@@ -494,53 +609,47 @@ def run_cli_loop(poll_interval: int = 120, probe_models: bool = True) -> None:
                         elif usage.h5_utilization < 80.0:
                             state_warned_80 = False
 
-                        # 3. Alerta de Incidente nos Servidores
-                        if len(incidents) > state_last_incidents:
-                            send_windows_toast("Incidente Anthropic", "Problema reportado nos servidores do Claude. Pode haver lentidão.")
-                            play_sound("error")
-                        state_last_incidents = len(incidents)
-                        
                         last_api_time = now
                     else:
                         # Falhou. Em vez de esperar 120s, espera só 10s pra tentar de novo.
                         last_api_time = now - poll_interval + 10
 
-                next_sec = max(0, int(poll_interval - (now - last_api_time)))
+                if fetching:
+                    next_refresh_text = "consultando..."
+                else:
+                    next_refresh_text = f"{max(0, int(poll_interval - (now - last_api_time)))}s"
                 dashboard = build_dashboard(
-                    monitor, usage, tokens, probes, incidents,
-                    last_update_str, next_sec, current_sessions, robot_frame
+                    monitor, usage, tokens, service,
+                    last_update_str, next_refresh_text, current_sessions, robot_frame
                 )
                 live.update(dashboard, refresh=True)
                 
                 # Loop rápido de 1 segundo para atualizar animações
-                import ctypes
-                hwnd = get_real_hwnd()
-                
                 for _ in range(10):
                     if not keep_running: break
-                    
+
                     # Combater o Win+D agressivo do Windows
-                    if is_topmost:
-                        if ctypes.windll.user32.IsIconic(hwnd):
-                            ctypes.windll.user32.ShowWindow(hwnd, 9) # SW_RESTORE
-                        
-                        # 0x0013 = SWP_NOMOVE (0x02) | SWP_NOSIZE (0x01) | SWP_NOACTIVATE (0x10)
-                        # Isso força a janela a ficar acima do Desktop (que o Win+D joga pra frente)
-                        # sem roubar o foco do teclado do usuário.
-                        ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0013)
-                            
+                    if is_topmost and console_hwnd:
+                        user32 = get_user32()
+                        if user32.IsIconic(console_hwnd):
+                            user32.ShowWindow(console_hwnd, SW_RESTORE)
+
+                        # SWP_NOACTIVATE força a janela a ficar acima do Desktop
+                        # (que o Win+D joga pra frente) sem roubar o foco do teclado.
+                        set_topmost(console_hwnd, True)
+
                     time.sleep(0.1)
                 tick_counter += 1
-                
+
         except KeyboardInterrupt:
             pass
         finally:
+            # Se o monitor rodou dentro de um terminal já aberto, ele continua
+            # existindo após sair: não pode ficar preso no topo nem oculto.
+            if console_hwnd:
+                if is_topmost:
+                    set_topmost(console_hwnd, False)
+                if is_hidden:
+                    get_user32().ShowWindow(console_hwnd, SW_SHOW)
             if tray_icon:
                 tray_icon.stop()
-
-if __name__ == "__main__":
-    cfg = load_config()
-    run_cli_loop(
-        poll_interval=cfg.get("poll_interval_sec", 120),
-        probe_models=cfg.get("probe_models", True)
-    )

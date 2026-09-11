@@ -1,10 +1,9 @@
 """
 main.py - Ponto de entrada do Claude Usage Monitor.
-Inicia a interface gráfica moderna por padrão ou o modo terminal com --cli.
+Inicia o dashboard no terminal por padrão ou exibe um relatório único com --once.
 """
 import argparse
 import sys
-import tkinter as tk
 
 # Garantir UTF-8 no terminal Windows
 if sys.platform == "win32":
@@ -17,7 +16,7 @@ from config import get_claude_token, load_config
 from monitor_core import ClaudeMonitor
 
 def run_once():
-    token, origin = get_claude_token()
+    token, origin = get_claude_token(load_config().get("manual_token"))
     if not token:
         print("[ERRO] Nenhum token do Claude encontrado!")
         sys.exit(1)
@@ -51,39 +50,26 @@ def run_once():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Claude Usage Monitor - Monitore seus limites e consumo do Claude Code no desktop."
-    )
-    parser.add_argument(
-        "--cli", action="store_true",
-        help="Executar em modo Terminal Interativo (Rich Dashboard)."
+        description="Claude Usage Monitor - Monitore seus limites e consumo do Claude Code no terminal."
     )
     parser.add_argument(
         "--once", action="store_true",
         help="Apenas exibir o uso atual uma vez no terminal e sair."
     )
-    parser.add_argument(
-        "--mini", action="store_true",
-        help="Abrir a interface gráfica diretamente em modo mini-widget."
-    )
+    # Mantido por compatibilidade: o dashboard no terminal agora é o modo padrão
+    parser.add_argument("--cli", action="store_true", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
 
     if args.once:
         run_once()
-    elif args.cli:
+    else:
         from cli_view import run_cli_loop
         cfg = load_config()
         run_cli_loop(
             poll_interval=cfg.get("poll_interval_sec", 120),
-            probe_models=cfg.get("probe_models", True)
+            manual_token=cfg.get("manual_token", "")
         )
-    else:
-        from gui import ClaudeUsageApp
-        root = tk.Tk()
-        app = ClaudeUsageApp(root)
-        if args.mini and not app.is_mini_mode:
-            app.toggle_mini_mode()
-        root.mainloop()
 
 if __name__ == "__main__":
     main()

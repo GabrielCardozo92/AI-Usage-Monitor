@@ -15,11 +15,7 @@ PROJECTS_DIR = CLAUDE_DIR / "projects"
 # Configurações padrão
 DEFAULT_CONFIG = {
     "poll_interval_sec": 120,      # Intervalo padrão de atualização em segundos
-    "probe_models": True,          # Se deve testar latência dos modelos
-    "always_on_top": False,        # Janela sempre no topo
-    "mini_mode": False,            # Iniciar em modo mini-widget
     "manual_token": "",            # Token manual caso o usuário não use o login local
-    "theme": "dark"
 }
 
 def load_config() -> dict:
@@ -33,14 +29,6 @@ def load_config() -> dict:
         except Exception:
             pass
     return cfg
-
-def save_config(cfg: dict) -> None:
-    """Salva configurações no arquivo JSON."""
-    try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2)
-    except Exception:
-        pass
 
 def get_claude_token(manual_token: Optional[str] = None) -> Tuple[Optional[str], str]:
     """
