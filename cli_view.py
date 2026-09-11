@@ -29,6 +29,11 @@ console = Console(legacy_windows=False)
 
 ROBOT_FRAMES = ["( 🤖 ) zZ ", "( 🤖 )  zZ", "( 🤖 )   z"]
 
+# Alturas do dashboard, em linhas (com as bordas)
+HEADER_ROWS, MAIN_ROWS, FOOTER_ROWS = 3, 14, 3
+DETAILS_MIN_ROWS = 9  # O painel de saúde usa 7 linhas + bordas
+TOKEN_ROWS = 3        # Entrada, Saída, Cache
+
 # ---- CONFIGURAÇÕES DA BANDEJA DO SISTEMA (SYSTEM TRAY) ----
 tray_icon = None
 is_hidden = False
@@ -270,18 +275,31 @@ def make_marked_gauge(pct: float, marks: int = 5, cells_per_mark: int = 5) -> Te
         bar.append("┊", style=f"bold {color}" if reached else "dim white")
     return bar
 
+def session_sort_key(s: ClaudeSession):
+    """Quem espera por você primeiro, depois quem está trabalhando, depois as livres."""
+    group = 0 if is_waiting(s) else 1 if s.status == "busy" else 2
+    return group, s.name.lower()
+
 def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage,
                     service: ServiceStatus, last_update_str: str,
-                    next_refresh_text: str, active_sessions: dict, robot_frame: str) -> Layout:
+                    next_refresh_text: str, active_sessions: dict, robot_frame: str,
+                    term_height: int = 0) -> Layout:
     # UsageData() vazio (sem erro) = a primeira consulta ainda não voltou
     loading = not usage.ok and not usage.error_msg
 
+    # O painel de baixo cresce com o número de sessões, até o que cabe no terminal.
+    # Por dentro: 3 linhas de tokens, 1 em branco e 1 por sessão (+2 das bordas).
+    height = term_height or console.size.height
+    wanted = TOKEN_ROWS + 1 + max(1, len(active_sessions)) + 2
+    details_rows = max(DETAILS_MIN_ROWS, min(wanted, height - HEADER_ROWS - MAIN_ROWS - FOOTER_ROWS))
+    session_capacity = details_rows - 2 - TOKEN_ROWS - 1
+
     layout = Layout()
     layout.split_column(
-        Layout(name="header", size=3),
-        Layout(name="main", size=14),
-        Layout(name="details", size=9),
-        Layout(name="footer", size=3)
+        Layout(name="header", size=HEADER_ROWS),
+        Layout(name="main", size=MAIN_ROWS),
+        Layout(name="details", size=details_rows),
+        Layout(name="footer", size=FOOTER_ROWS)
     )
 
     # ── Cabeçalho ─────────────────────────────────────────────
@@ -397,14 +415,18 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
     token_table.add_row("Saída:", f"{monitor.format_tokens(tokens.output_tokens)} tokens")
     token_table.add_row("Cache:", f"{monitor.format_tokens(tokens.cache_tokens)} tokens")
     
-    # Monta a lista visual das sessões
-    mascot_text = Text()
+    # Monta a lista visual das sessões: uma linha por sessão, cortada com "…" se não couber
+    # (uma linha quebrada empurraria as sessões seguintes para fora do painel)
+    mascot_text = Text(no_wrap=True, overflow="ellipsis")
     mascot_text.append("\n")
     if not active_sessions:
         mascot_text.append(f" {robot_frame} ", style="bold cyan")
         mascot_text.append(" Nenhum terminal rodando Claude...", style="dim")
     else:
-        for s in active_sessions.values():
+        ordered = sorted(active_sessions.values(), key=session_sort_key)
+        # Se não couber tudo, a última linha vira o aviso de quantas ficaram de fora
+        shown = ordered if len(ordered) <= session_capacity else ordered[:session_capacity - 1]
+        for s in shown:
             folder_name = s.name
             if len(folder_name) > 15:
                 folder_name = folder_name[:12] + "..."
@@ -434,12 +456,19 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
             else:
                 icon, state, style = "✨", "Livre", "bold green"
 
+            # Do mais para o menos importante: se a linha não couber, o "…" corta o modelo
             mascot_text.append(f" {icon}  ", style=style)
             mascot_text.append(f"{folder_name} ", style="bold white")
-            if s.model:
-                mascot_text.append(f"[{s.model.replace('claude-', '').title()}] ", style="dim cyan")
+            mascot_text.append(f"({state}) ", style=style)
             mascot_text.append(f"{ctx_str} ", style=ctx_style)
-            mascot_text.append(f"({state})\n", style=style)
+            if s.model:
+                mascot_text.append(f"[{s.model.replace('claude-', '').title()}]", style="dim cyan")
+            mascot_text.append("\n")
+
+        hidden = len(ordered) - len(shown)
+        if hidden:
+            plural = "sessão" if hidden == 1 else "sessões"
+            mascot_text.append(f" … +{hidden} {plural} sem espaço (aumente a janela do terminal)\n", style="dim")
 
     tokens_content = Layout()
     tokens_content.split_column(
