@@ -251,6 +251,25 @@ def make_gauge_bar(pct: float, total_bars: int = 24) -> Text:
     t.append("░" * empty, style="dim white")
     return t
 
+def make_marked_gauge(pct: float, marks: int = 5, cells_per_mark: int = 5) -> Text:
+    """
+    Barra com um marcador pontilhado a cada 100/marks % (padrão: a cada 20%).
+    O terminal não desenha entre dois caracteres, então cada marcador ocupa uma coluna
+    própria depois de cada grupo de blocos; por isso a barra tem marks * cells_per_mark blocos.
+    Marcadores já alcançados ficam na cor da barra; os que faltam, apagados.
+    """
+    total = marks * cells_per_mark
+    filled = max(0, min(total, int(round(pct / 100.0 * total))))
+    color = get_color_for_pct(pct)
+    bar = Text()
+    for m in range(marks):
+        seg_filled = max(0, min(cells_per_mark, filled - m * cells_per_mark))
+        bar.append("█" * seg_filled, style=color)
+        bar.append("░" * (cells_per_mark - seg_filled), style="dim white")
+        reached = filled >= (m + 1) * cells_per_mark
+        bar.append("┊", style=f"bold {color}" if reached else "dim white")
+    return bar
+
 def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage,
                     service: ServiceStatus, last_update_str: str,
                     next_refresh_text: str, active_sessions: dict, robot_frame: str) -> Layout:
@@ -337,7 +356,7 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
     else:
         d7_content.append(f"\n   {usage.d7_utilization:.0f}%\n", style=f"bold {d7_color}")
         d7_content.append("   ")
-        d7_content.append_text(make_gauge_bar(usage.d7_utilization, 26))
+        d7_content.append_text(make_marked_gauge(usage.d7_utilization))  # Marcadores a cada 20%
         d7_content.append("\n\n")
         d7_content.append("   ⏳ Reset em: ", style="dim white")
         d7_content.append(f"{d7_countdown}\n", style="bold white")
