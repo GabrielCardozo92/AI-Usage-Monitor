@@ -21,6 +21,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+import usage_history
 from config import get_claude_token
 from monitor_core import ClaudeMonitor, ClaudeSession, ServiceStatus, UsageData, TokenUsage
 from statusline import context_thresholds, format_window
@@ -275,6 +276,16 @@ def make_marked_gauge(pct: float, marks: int = 5, cells_per_mark: int = 5) -> Te
         bar.append("┊", style=f"bold {color}" if reached else "dim white")
     return bar
 
+def format_projects(projects: list, top: int = 3) -> str:
+    """Ex.: 'AutomacaoGui 62% · claude-usage… 30% · outros 8%' (fatias de 0 a 1)."""
+    # Projetos com menos de 1% vão para "outros", que só aparece se somar 1% ou mais
+    main = [(name, share) for name, share in projects[:top] if share >= 0.01]
+    rest = sum(share for _, share in projects) - sum(share for _, share in main)
+    parts = [f"{name if len(name) <= 14 else name[:13] + '…'} {share * 100:.0f}%" for name, share in main]
+    if rest >= 0.01:
+        parts.append(f"outros {rest * 100:.0f}%")
+    return " · ".join(parts)
+
 def session_sort_key(s: ClaudeSession):
     """Quem espera por você primeiro, depois quem está trabalhando, depois as livres."""
     group = 0 if is_waiting(s) else 1 if s.status == "busy" else 2
@@ -283,7 +294,7 @@ def session_sort_key(s: ClaudeSession):
 def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage,
                     service: ServiceStatus, last_update_str: str,
                     next_refresh_text: str, active_sessions: dict, robot_frame: str,
-                    term_height: int = 0) -> Layout:
+                    term_height: int = 0, projects: list = None) -> Layout:
     # UsageData() vazio (sem erro) = a primeira consulta ainda não voltou
     loading = not usage.ok and not usage.error_msg
 
@@ -377,14 +388,21 @@ def build_dashboard(monitor: ClaudeMonitor, usage: UsageData, tokens: TokenUsage
         d7_content.append_text(make_marked_gauge(usage.d7_utilization))  # Marcadores a cada 20%
         d7_content.append("\n\n")
         d7_content.append("   ⏳ Reset em: ", style="dim white")
-        d7_content.append(f"{d7_countdown}\n", style="bold white")
-        d7_content.append("   📅 Data do Reset: ", style="dim white")
-        d7_content.append(f"{d7_reset_time}\n", style="dim cyan")
+        d7_content.append(f"{d7_countdown} ", style="bold white")
+        d7_content.append(f"({d7_reset_time})\n", style="dim cyan")
         d7_proj, d7_proj_color = monitor.get_weekly_projection_text(usage.d7_utilization, usage.d7_reset_epoch)
         d7_content.append("   🔮 Projeção: ", style="dim white")
         d7_content.append(f"{d7_proj}\n", style=f"bold {d7_proj_color}")
-        d7_content.append("   📊 Por dia: ", style="dim white")
+        d7_content.append("   🎯 Meta: ", style="dim white")
         d7_content.append(f"{monitor.get_daily_budget_text(usage.d7_utilization, usage.d7_reset_epoch)}\n", style="bold white")
+        # Quanto foi usado em cada dia da semana (anotado pela status line e pelo monitor)
+        days = usage_history.daily_usage(usage_history.load_samples(), usage.d7_reset_epoch, now)
+        if days:
+            d7_content.append("   📈 Por dia: ", style="dim white")
+            d7_content.append(f"{usage_history.format_daily(days)}\n", style="white")
+        if projects:
+            d7_content.append("   📁 Projetos: ", style="dim white")
+            d7_content.append(f"{format_projects(projects)}\n", style="white")
         # Os status só aparecem como alerta: "allowed" não acrescenta nada à porcentagem
         # (e, com a status line, é deduzido dela). A API pode mandar "allowed_warning".
         if usage.d7_status not in ("allowed", "unknown"):
@@ -576,15 +594,23 @@ def fetch_api_data(monitor: ClaudeMonitor, manual_token: str):
     return usage, service
 
 class UsageAlerts:
-    """Notificações ligadas ao uso de 5h: reset da janela e aviso de 80%."""
+    """Notificações de uso: reset da janela de 5h e avisos de 80% (5h e semanal)."""
 
     def __init__(self):
         self.last_h5_reset = 0
         self.warned_80 = False
+        self.last_d7_reset = 0
+        self.warned_d7_80 = False
 
     def check(self, usage: UsageData) -> None:
-        if not usage.ok or not usage.h5_reset_epoch:
+        if not usage.ok:
             return
+        if usage.h5_reset_epoch:
+            self._check_h5(usage)
+        if usage.d7_reset_epoch:
+            self._check_d7(usage)
+
+    def _check_h5(self, usage: UsageData) -> None:
         # Uma janela nova termina horas depois da anterior; a margem evita alarme falso
         # quando API e status line informam o mesmo reset com segundos de diferença.
         if self.last_h5_reset and usage.h5_reset_epoch > self.last_h5_reset + 3600:
@@ -599,6 +625,88 @@ class UsageAlerts:
             self.warned_80 = True
         elif usage.h5_utilization < 80.0:
             self.warned_80 = False
+
+    def _check_d7(self, usage: UsageData) -> None:
+        # Semana nova: o reset avança dias, não segundos
+        if self.last_d7_reset and usage.d7_reset_epoch > self.last_d7_reset + 86400:
+            self.warned_d7_80 = False
+        self.last_d7_reset = usage.d7_reset_epoch
+
+        if usage.d7_utilization >= 80.0 and not self.warned_d7_80:
+            reset = datetime.fromtimestamp(usage.d7_reset_epoch).strftime("%d/%m às %H:%M")
+            send_windows_toast("Alerta de Limite Semanal",
+                               f"Você já usou {usage.d7_utilization:.0f}% da cota semanal. O reset é em {reset}.")
+            play_sound("warning")
+            self.warned_d7_80 = True
+        elif usage.d7_utilization < 80.0:
+            self.warned_d7_80 = False
+
+class SessionAlerts:
+    """
+    Notificações das sessões do Claude Code: tarefa concluída, aguardando você e
+    contexto grande. Compara cada leitura com a anterior.
+    """
+
+    def __init__(self, monitor: ClaudeMonitor):
+        self.monitor = monitor
+        self.last: dict = {}
+        self.ctx_alerted: set = set()  # pids já avisados de contexto grande
+
+    def check(self, sessions: dict) -> None:
+        for pid, sess in sessions.items():
+            prev = self.last.get(pid)
+            if prev:
+                if is_waiting(sess) and not is_waiting(prev):
+                    # Parou no meio da tarefa esperando o usuário (autorização, pergunta...)
+                    send_windows_toast(f"Claude aguardando você: {sess.name}", f"Motivo: {waiting_reason(sess)}")
+                    play_sound("warning")
+                elif prev.status == "busy" and sess.status != "busy" and not is_waiting(sess):
+                    # Acabou de terminar uma tarefa nessa sessão! O status final pode ser
+                    # "idle" ou "shell" (ocioso, mas com um comando rodando em segundo plano).
+                    send_windows_toast(f"Tarefa Concluída: {sess.name}", "O Claude terminou o processo e aguarda comando.")
+                    play_sound("success")
+            self._check_context(pid, sess)
+
+        self.ctx_alerted &= set(sessions)  # Esquece sessões que fecharam
+        self.last = sessions
+
+    def _check_context(self, pid: int, sess: ClaudeSession) -> None:
+        warn, crit = context_thresholds(sess.context_window)
+        if sess.context_tokens > crit and pid not in self.ctx_alerted:
+            used = self.monitor.format_tokens(sess.context_tokens)
+            size = f"{used}/{format_window(sess.context_window)}" if sess.context_window else used
+            send_windows_toast(f"Contexto grande: {sess.name}",
+                               f"{size} de contexto. Considere /clear ou /compact para economizar cota.")
+            play_sound("warning")
+            self.ctx_alerted.add(pid)
+        elif sess.context_tokens < warn:
+            # Voltou ao normal (após /clear ou /compact): pode avisar de novo no futuro
+            self.ctx_alerted.discard(pid)
+
+class IncidentAlerts:
+    """Notifica incidentes novos do status page, comparando pelo id."""
+
+    def __init__(self):
+        self.known_ids: set = set()
+
+    def check(self, service: ServiceStatus) -> None:
+        # Só com o status page respondendo: uma falha de rede não pode esquecer os
+        # incidentes conhecidos e depois realertar os mesmos
+        if not service.ok:
+            return
+        # Por id: um incidente resolvido e outro aberto na mesma consulta mantêm a
+        # contagem, mas o novo ainda precisa de aviso
+        new = [i for i in service.incidents if i.id not in self.known_ids]
+        if new:
+            first = new[0]
+            msg = first.display_name
+            if first.components:
+                msg += f" ({', '.join(first.components)})"
+            if len(new) > 1:
+                msg += f" e mais {len(new) - 1}"
+            send_windows_toast("Incidente na Anthropic", msg)
+            play_sound("error")
+        self.known_ids = {i.id for i in service.incidents}
 
 def run_cli_loop(poll_interval: int = 120, manual_token: str = "") -> None:
     global keep_running, console_hwnd
@@ -628,13 +736,15 @@ def run_cli_loop(poll_interval: int = 120, manual_token: str = "") -> None:
     last_update_str = "--:--:--"
 
     alerts = UsageAlerts()
+    session_alerts = SessionAlerts(monitor)
+    incident_alerts = IncidentAlerts()
     last_statusline_check = 0.0
+    projects = []
+    last_projects_time = 0.0
+    usage_history.prune()
 
     # Frame da animação do robozinho
     tick_counter = 0
-
-    # Controle Exato de Status (via sessões do Claude Code)
-    last_sessions = {}
 
     # A consulta à API roda numa thread e entrega o resultado por esta fila,
     # para a tela, as sessões e o "Fixar no Topo" não congelarem durante a rede.
@@ -648,27 +758,17 @@ def run_cli_loop(poll_interval: int = 120, manual_token: str = "") -> None:
                 
                 # --- FAST POLLING: Lendo Status da Sessão (A cada 1 segundo) ---
                 current_sessions = monitor.get_claude_sessions()
-                
-                for pid, sess in current_sessions.items():
-                    prev_sess = last_sessions.get(pid)
-                    if not prev_sess:
-                        continue
-                    if is_waiting(sess) and not is_waiting(prev_sess):
-                        # Parou no meio da tarefa esperando o usuário (autorização, pergunta...)
-                        send_windows_toast(f"Claude aguardando você: {sess.name}", f"Motivo: {waiting_reason(sess)}")
-                        play_sound("warning")
-                    elif prev_sess.status == "busy" and sess.status != "busy" and not is_waiting(sess):
-                        # Acabou de terminar uma tarefa nessa sessão! O status final pode ser
-                        # "idle" ou "shell" (ocioso, mas com um comando rodando em segundo plano).
-                        send_windows_toast(f"Tarefa Concluída: {sess.name}", "O Claude terminou o processo e aguarda comando.")
-                        play_sound("success")
-                
-                last_sessions = current_sessions
-                
+                session_alerts.check(current_sessions)
+
                 # Polling de Tokens (A cada 3 segundos)
                 if now - last_local_time >= 3.0:
                     tokens = monitor.collect_local_tokens(usage.h5_reset_epoch)
                     last_local_time = now
+
+                # Consumo por projeto na semana (muda devagar: a cada 30s basta)
+                if now - last_projects_time >= 30.0:
+                    projects = monitor.project_breakdown(usage.d7_reset_epoch)
+                    last_projects_time = now
 
                 # --- Frames de Animação para o caso "Vazio/Offline" ---
                 robot_frame = ROBOT_FRAMES[tick_counter % len(ROBOT_FRAMES)]
@@ -700,27 +800,17 @@ def run_cli_loop(poll_interval: int = 120, manual_token: str = "") -> None:
                     fetching = False
                     now = time.time()
 
-                    # Só atualiza se o status page respondeu: uma falha de rede não pode
-                    # zerar a contagem de incidentes e depois realertar os mesmos.
-                    if new_service.ok:
-                        # Compara por id: um incidente resolvido e outro aberto na mesma
-                        # consulta mantêm a contagem, mas o novo ainda precisa de aviso.
-                        known = {i.id for i in service.incidents}
-                        new = [i for i in new_service.incidents if i.id not in known]
-                        if new:
-                            first = new[0]
-                            msg = first.display_name
-                            if first.components:
-                                msg += f" ({', '.join(first.components)})"
-                            if len(new) > 1:
-                                msg += f" e mais {len(new) - 1}"
-                            send_windows_toast("Incidente na Anthropic", msg)
-                            play_sound("error")
+                    incident_alerts.check(new_service)
+                    if new_service.ok:  # Falha do status page mantém o último estado conhecido
                         service = new_service
 
                     if usage.ok:
                         last_update_str = datetime.fromtimestamp(usage.timestamp).strftime("%H:%M:%S")
                         alerts.check(usage)
+                        if usage.source == "API":
+                            # A status line já anota o que vem dela; a API cobre o uso feito
+                            # fora do Claude Code (claude.ai, celular) quando nenhuma sessão responde
+                            usage_history.append_sample(usage.h5_utilization, usage.d7_utilization, usage.d7_reset_epoch)
                         last_api_time = now
                     else:
                         # Falhou. Em vez de esperar 120s, espera só 10s pra tentar de novo.
@@ -732,7 +822,8 @@ def run_cli_loop(poll_interval: int = 120, manual_token: str = "") -> None:
                     next_refresh_text = f"{max(0, int(poll_interval - (now - last_api_time)))}s"
                 dashboard = build_dashboard(
                     monitor, usage, tokens, service,
-                    last_update_str, next_refresh_text, current_sessions, robot_frame
+                    last_update_str, next_refresh_text, current_sessions, robot_frame,
+                    projects=projects
                 )
                 live.update(dashboard, refresh=True)
                 

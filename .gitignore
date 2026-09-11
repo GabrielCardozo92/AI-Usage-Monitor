@@ -6,6 +6,7 @@ __pycache__/
 config.json
 statusline_data/
 translations.json
+usage_history.jsonl
 .env
 .credentials.json
 

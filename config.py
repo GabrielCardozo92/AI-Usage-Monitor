@@ -10,6 +10,7 @@ APP_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = APP_DIR / "config.json"
 STATUSLINE_DIR = APP_DIR / "statusline_data"  # Dados gravados pelo statusline.py, um arquivo por sessão
 TRANSLATIONS_FILE = APP_DIR / "translations.json"  # Cache das traduções dos nomes de incidentes
+HISTORY_FILE = APP_DIR / "usage_history.jsonl"  # Uso ao longo do tempo (histórico por dia da semana)
 CLAUDE_DIR = Path.home() / ".claude"
 CREDENTIALS_FILE = CLAUDE_DIR / ".credentials.json"
 PROJECTS_DIR = CLAUDE_DIR / "projects"

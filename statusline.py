@@ -3,8 +3,8 @@ statusline.py - Status line do Claude Code (fonte oficial de uso para o monitor)
 
 O Claude Code executa este script a cada nova resposta e passa, pelo stdin, um JSON com
 o uso de 5h/7d do plano (rate_limits) e a janela de contexto da sessão (context_window).
-O script grava esses dados em statusline_data/<session_id>.json, que o monitor lê, e
-imprime uma linha compacta no rodapé do Claude Code.
+O script grava esses dados em statusline_data/<session_id>.json, que o monitor lê, anota
+o uso em usage_history.jsonl (histórico por dia) e imprime uma linha compacta no rodapé.
 
 Configuração em ~/.claude/settings.json:
     "statusLine": {"type": "command", "command": "python C:/caminho/para/statusline.py"}
@@ -17,6 +17,7 @@ import sys
 import time
 
 from config import STATUSLINE_DIR
+from usage_history import append_sample
 
 # Para janelas grandes, o alerta de contexto usa limites absolutos (contexto grande
 # consome cota rápido); para janelas pequenas, uma fração da janela (perto do auto-compact).
@@ -97,6 +98,10 @@ def main() -> None:
         return
     try:
         write_snapshot(data)
+        rate = data.get("rate_limits") or {}
+        d7 = rate.get("seven_day") or {}
+        append_sample((rate.get("five_hour") or {}).get("used_percentage"),
+                      d7.get("used_percentage"), d7.get("resets_at"))
     except Exception:
         pass  # Falha ao gravar não pode apagar a linha do rodapé
     try:

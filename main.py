@@ -42,7 +42,11 @@ def run_once():
     print(f"Projecao:    {proj}")
     print(f"Janela 7d:   {usage.d7_utilization:.0f}% | Reset em: {monitor.format_countdown(sec_7d)} | Status: {usage.d7_status.upper()}")
     print(f"Projecao 7d: {monitor.get_weekly_projection_text(usage.d7_utilization, usage.d7_reset_epoch)[0]}")
-    print(f"Por dia:     {monitor.get_daily_budget_text(usage.d7_utilization, usage.d7_reset_epoch)}")
+    print(f"Meta:        {monitor.get_daily_budget_text(usage.d7_utilization, usage.d7_reset_epoch)}")
+    from cli_view import format_projects
+    projects = format_projects(monitor.project_breakdown(usage.d7_reset_epoch))
+    if projects:
+        print(f"Projetos 7d: {projects}")
     claim = {"five_hour": "Janela 5h", "seven_day": "Janela 7d"}.get(usage.representative_claim, "--")
     print(f"Limitador:   {claim}")
     print(f"Fonte:       {usage.source}")

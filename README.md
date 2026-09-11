@@ -16,7 +16,9 @@ Inspirado no projeto [Claude Usage Stick](https://github.com/benevid/claude-usag
 - **Janela Semanal (7 Dias)**:
   - Utilização acumulada da semana e prazo de reset, com marcadores na barra a cada 20%.
   - **Projeção semanal**: no ritmo atual, a quanto chega no reset ou quando esgota (a partir de 12h de janela).
-  - **Por dia**: quanto dá para usar por dia, em média, sem estourar antes do reset.
+  - **Meta**: quanto dá para usar por dia, em média, sem estourar antes do reset.
+  - **Por dia**: quanto da cota semanal foi usado em cada dia (fatias de 24h a partir do início da janela). A status line e o monitor anotam o uso em `usage_history.jsonl`; dias sem anotação suficiente aparecem como `--`, e `≥` indica um mínimo (a anotação começou no meio do dia).
+  - **Projetos**: fatia estimada de cada projeto no consumo local da semana, pelos transcripts (tokens ponderados pelas proporções de preço da API; não considera a diferença entre modelos nem o uso no claude.ai/celular).
   - Status da janela e status geral aparecem só como alerta (`ALLOWED_WARNING` ou `REJECTED`).
 
 - **Tokens e Sessões do Claude Code**:
@@ -31,7 +33,7 @@ Inspirado no projeto [Claude Usage Stick](https://github.com/benevid/claude-usag
   - O nome do incidente é traduzido para português pelo próprio Claude Code (`claude -p` com Haiku), uma única vez por incidente, e guardado em `translations.json`. Sem o Claude Code disponível, o nome aparece em inglês.
 
 - **Integração com o Windows**:
-  - **Notificações nativas com som**: tarefa concluída, Claude aguardando você, limite de 5h resetado, uso acima de 80% e novos incidentes (com o nome do incidente).
+  - **Notificações nativas com som**: tarefa concluída, Claude aguardando você, contexto grande numa sessão (sugere `/clear` ou `/compact`), limite de 5h resetado, uso acima de 80% (5h e semanal) e novos incidentes (com o nome do incidente).
   - **Ícone na bandeja do sistema**: ocultar/mostrar o terminal (duplo clique) e **Fixar no Topo**, que mantém o monitor visível mesmo após o Win+D.
 
 - **Relatório Rápido (`--once`)**: exibe os limites uma única vez no terminal e sai.
@@ -59,6 +61,13 @@ python main.py
 ```bash
 python main.py --once
 ```
+
+### Rodar os Testes
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests/
+```
+Os testes usam pastas temporárias: não leem nem alteram `~/.claude` nem os dados reais do monitor.
 
 ---
 

@@ -28,6 +28,13 @@ PROBE_MODEL = "claude-haiku-4-5-20251001"
 # (nenhuma sessão local respondendo), o monitor volta a consultar a API.
 STATUSLINE_MAX_AGE_SEC = 300
 
+# Transcripts mais velhos que isso não entram em nenhuma janela (a maior é a semanal)
+TRANSCRIPT_CACHE_MAX_AGE = 8 * 86400
+
+# Peso de cada tipo de token no consumo por projeto: proporções de preço da API
+# (entrada 1x, saída ~5x a entrada, leitura de cache 10% da entrada)
+USAGE_WEIGHTS = (1.0, 5.0, 0.1)
+
 # Serviços do status.claude.com exibidos no painel: (nome exibido, prefixo do nome no status page)
 WATCHED_COMPONENTS = [
     ("Claude API", "Claude API"),
@@ -204,6 +211,15 @@ class _TranscriptCache:
     inode: int
     offset: int = 0                      # Bytes já processados (sempre no fim de uma linha)
     records: List[UsageRecord] = field(default_factory=list)
+    project: str = ""                    # Pasta do projeto (do campo cwd do transcript)
+
+def _project_name(raw: bytes) -> str:
+    """Nome da pasta do projeto a partir de uma linha do transcript com o campo cwd."""
+    try:
+        cwd = json.loads(raw).get("cwd") or ""
+        return Path(cwd).name if cwd else ""
+    except (ValueError, AttributeError):
+        return ""
 
 def _read_snapshot(session_id: Optional[str]) -> dict:
     """Dados que a status line gravou para a sessão, ou {} se não houver."""
@@ -418,7 +434,7 @@ class ClaudeMonitor:
         e completo de nenhuma sessão.
         """
         now = time.time()
-        best = None
+        candidates = []  # (captured, h5, d7) de cada sessão com dado utilizável
         for f in STATUSLINE_DIR.glob("*.json"):
             try:
                 snap = json.loads(f.read_text(encoding="utf-8"))
@@ -435,16 +451,18 @@ class ClaudeMonitor:
                 continue
             if h5.get("resets_at", 0) <= now or d7.get("resets_at", 0) <= now:
                 continue
-            # Cada sessão guarda o uso da SUA última resposta, então o arquivo gravado por
-            # último pode ter dado velho. Dentro de uma janela o uso só cresce: a janela mais
-            # nova e, nela, o maior percentual são a leitura mais recente.
-            key = (h5.get("resets_at", 0), h5.get("used_percentage") or 0, d7.get("used_percentage") or 0)
-            if best is None or key > best[0]:
-                best = (key, captured, h5, d7)
+            candidates.append((captured, h5, d7))
 
-        if best is None:
+        if not candidates:
             return None
-        _, captured, h5, d7 = best
+        # Cada sessão guarda o uso da SUA última resposta, então o arquivo gravado por
+        # último pode ter dado velho. Dentro de uma janela o uso só cresce: vale a janela
+        # de 5h mais nova e, nela, o maior percentual. Resets a menos de 1h um do outro
+        # são a mesma janela (uma janela nova termina pelo menos 5h depois da anterior).
+        newest_reset = max(h5.get("resets_at", 0) for _, h5, _ in candidates)
+        same_window = [c for c in candidates if c[1].get("resets_at", 0) > newest_reset - 3600]
+        captured, h5, d7 = max(same_window, key=lambda c: (c[1].get("used_percentage") or 0,
+                                                            c[2].get("used_percentage") or 0))
         h5_pct = float(h5.get("used_percentage") or 0)
         d7_pct = float(d7.get("used_percentage") or 0)
         # A status line não informa o status nem o fator limitante: status derivado do uso
@@ -527,24 +545,12 @@ class ClaudeMonitor:
         seen_ids = set()
         active_sessions = set()
 
-        # Recursivo para incluir os transcripts de subagentes,
-        # que ficam em projects/<projeto>/<sessão>/subagents/*.jsonl
-        pattern = os.path.join(str(PROJECTS_DIR), "**", "*.jsonl")
-
-        for file_path in glob.glob(pattern, recursive=True):
-            try:
-                if os.path.getmtime(file_path) < window_start - 60:
-                    self._transcripts.pop(file_path, None)  # Saiu da janela: libera a memória
-                    continue
-                records = self._read_transcript_usage(file_path)
-            except OSError:
-                continue
-
+        for file_path, cache in self._transcripts_since(window_start):
             # Um subagente conta como parte da sessão que o criou
             p = Path(file_path)
             session_key = p.parent.parent.name if p.parent.name == "subagents" else p.stem
 
-            for ts, msg_id, r_in, r_out, r_cache in records:
+            for ts, msg_id, r_in, r_out, r_cache in cache.records:
                 if ts < window_start:
                     continue
                 if msg_id:
@@ -564,9 +570,61 @@ class ClaudeMonitor:
             window_start_epoch=window_start
         )
 
-    def _read_transcript_usage(self, file_path: str) -> List[UsageRecord]:
+    def project_breakdown(self, d7_reset_epoch: Optional[int] = None) -> List[Tuple[str, float]]:
         """
-        Devolve os registros de uso de um transcript, lendo do disco só o que foi
+        Fatia de cada projeto no consumo local da janela semanal (0 a 1), do maior para o menor.
+        É uma estimativa: pondera os tokens pelas proporções de preço da API e ignora a
+        diferença entre modelos e o uso fora do Claude Code (claude.ai, celular).
+        """
+        now = time.time()
+        if d7_reset_epoch and d7_reset_epoch > now:
+            window_start = d7_reset_epoch - 7 * 86400
+        else:
+            window_start = now - 7 * 86400
+
+        w_in, w_out, w_cache = USAGE_WEIGHTS
+        totals: Dict[str, float] = {}
+        seen_ids = set()
+        for file_path, cache in self._transcripts_since(window_start):
+            project = cache.project or Path(file_path).relative_to(PROJECTS_DIR).parts[0]
+            for ts, msg_id, r_in, r_out, r_cache in cache.records:
+                if ts < window_start:
+                    continue
+                if msg_id:
+                    if msg_id in seen_ids:
+                        continue
+                    seen_ids.add(msg_id)
+                totals[project] = totals.get(project, 0.0) + r_in * w_in + r_out * w_out + r_cache * w_cache
+
+        total = sum(totals.values())
+        if not total:
+            return []
+        return sorted(((p, v / total) for p, v in totals.items()), key=lambda item: -item[1])
+
+    def _transcripts_since(self, since: float):
+        """
+        (caminho, cache) de cada transcript modificado desde `since`, com os registros
+        de uso atualizados. Busca recursiva para incluir os transcripts de subagentes,
+        que ficam em projects/<projeto>/<sessão>/subagents/*.jsonl.
+        """
+        pattern = os.path.join(str(PROJECTS_DIR), "**", "*.jsonl")
+        oldest_needed = time.time() - TRANSCRIPT_CACHE_MAX_AGE
+        for file_path in glob.glob(pattern, recursive=True):
+            try:
+                mtime = os.path.getmtime(file_path)
+                if mtime < oldest_needed:
+                    self._transcripts.pop(file_path, None)  # Fora de qualquer janela: libera a memória
+                    continue
+                if mtime < since - 60:
+                    continue
+                cache = self._read_transcript(file_path)
+            except OSError:
+                continue
+            yield file_path, cache
+
+    def _read_transcript(self, file_path: str) -> _TranscriptCache:
+        """
+        Atualiza e devolve o cache de um transcript, lendo do disco só o que foi
         acrescentado desde a última chamada (os transcripts só crescem).
         """
         st = os.stat(file_path)
@@ -584,11 +642,13 @@ class ClaudeMonitor:
             end = chunk.rfind(b"\n") + 1
             cache.offset += end
             for raw in chunk[:end].splitlines():
+                if not cache.project and b'"cwd"' in raw:
+                    cache.project = _project_name(raw)
                 if b'"usage"' in raw:
                     record = _parse_usage_line(raw.decode("utf-8", errors="ignore"))
                     if record:
                         cache.records.append(record)
-        return cache.records
+        return cache
 
     @staticmethod
     def format_countdown(seconds: float) -> str:
@@ -670,7 +730,7 @@ class ClaudeMonitor:
 
         projected_total = d7_utilization + rate * remaining_sec
         if projected_total <= 100:
-            return f"No ritmo atual, chega a ~{projected_total:.0f}% no reset", "#4ADE80"
+            return f"Chega a ~{projected_total:.0f}% no reset", "#4ADE80"
 
         # Vai estourar a cota semanal antes do reset
         sec_to_exhaust = (100 - d7_utilization) / rate
@@ -680,7 +740,7 @@ class ClaudeMonitor:
         m = int((sec_to_exhaust % 3600) // 60)
         tempo_str = f"{d}d {h:02d}h" if d > 0 else f"{h}h{m:02d}m" if h > 0 else f"{m}m"
         color = "#F87171" if sec_to_exhaust < 86400 else "#FBBF24"
-        return f"No ritmo atual, esgota {weekday} às {when:%H:%M} (em {tempo_str})", color
+        return f"Esgota {weekday} às {when:%H:%M} (em {tempo_str})", color
 
     @staticmethod
     def get_daily_budget_text(d7_utilization: float, d7_reset_epoch: int) -> str:
